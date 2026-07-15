@@ -1,0 +1,20 @@
+1
+00:00:00,500 --> 00:00:02,000
+Welcome to the course.
+Let's begin.
+
+2
+00:00:02,250 --> 00:00:04,000
+Today we will learn about atoms.
+
+3
+00:00:04,500 --> 00:00:06,250
+An atom is a tiny unit of matter.
+
+4
+00:00:07,000 --> 00:00:09,000
+Keep this example in mind.
+
+5
+00:00:09,500 --> 00:00:11,750
+Thanks for watching!
