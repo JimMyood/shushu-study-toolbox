@@ -29,6 +29,77 @@ def test_defaults_when_no_config(tmp_path, monkeypatch):
     cfg = common.load_config()
     assert cfg["native_lang"] == "zh" and cfg["subtitle_layout"] == "original-top"
 
+
+def test_missing_config_is_detected_by_read_without_exists_precheck(
+    tmp_path, monkeypatch, capsys
+):
+    config_path = tmp_path / "config.json"
+
+    class ConfigPathDouble:
+        def exists(self):
+            raise AssertionError("load_config must not precheck with exists")
+
+        def read_text(self, **_kwargs):
+            raise FileNotFoundError("simulated race: config disappeared")
+
+        def __str__(self):
+            return str(config_path)
+
+    class RepoRootDouble:
+        def __truediv__(self, name):
+            assert name == "config.json"
+            return ConfigPathDouble()
+
+    monkeypatch.setattr(common, "REPO_ROOT", RepoRootDouble())
+
+    config = common.load_config()
+
+    captured = capsys.readouterr()
+    assert config == common.DEFAULTS
+    assert "复制 config.example.json 为 config.json 可自定义" in captured.out
+    assert captured.err == ""
+
+
+@pytest.mark.parametrize(
+    "read_error",
+    [
+        PermissionError("simulated unreadable file"),
+        OSError(13, "simulated parent directory not traversable"),
+    ],
+)
+def test_config_read_permission_errors_do_not_call_exists_or_leak_details(
+    tmp_path, monkeypatch, read_error
+):
+    config_path = tmp_path / "blocked" / "config.json"
+
+    class ConfigPathDouble:
+        def exists(self):
+            raise AssertionError("load_config must not precheck with exists")
+
+        def read_text(self, **_kwargs):
+            raise read_error
+
+        def __str__(self):
+            return str(config_path)
+
+    class RepoRootDouble:
+        def __truediv__(self, name):
+            assert name == "config.json"
+            return ConfigPathDouble()
+
+    monkeypatch.setattr(common, "REPO_ROOT", RepoRootDouble())
+
+    with pytest.raises(SystemExit) as error:
+        common.load_config()
+
+    message = str(error.value)
+    assert str(config_path) in message
+    assert "无法读取" in message
+    assert "UTF-8" in message
+    assert "当前用户可读" in message
+    assert "simulated" not in message
+    assert "PermissionError" not in message
+
 @pytest.mark.parametrize(
     ("contents", "problem"),
     [

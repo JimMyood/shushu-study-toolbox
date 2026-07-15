@@ -27,12 +27,11 @@ _WINDOWS_ILLEGAL_CHARS = frozenset('<>:"/\\|?*')
 def load_config() -> dict:
     """读取仓库配置，并以默认值补齐未配置的字段。"""
     config_path = REPO_ROOT / "config.json"
-    if not config_path.exists():
-        print("复制 config.example.json 为 config.json 可自定义")
-        return DEFAULTS.copy()
-
     try:
         raw_config = config_path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        print("复制 config.example.json 为 config.json 可自定义")
+        return DEFAULTS.copy()
     except (OSError, UnicodeError):
         raise SystemExit(
             f"无法读取配置文件 {config_path}。"

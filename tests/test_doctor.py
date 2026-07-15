@@ -64,6 +64,36 @@ def test_doctor_json_shape_values_and_success_exit(tmp_path, monkeypatch, capsys
     }
 
 
+@pytest.mark.parametrize("json_mode", [False, True])
+def test_missing_config_keeps_doctor_human_and_json_output_clean(
+    tmp_path, monkeypatch, capsys, json_mode
+):
+    fake_home = tmp_path / "home"
+    fake_home.mkdir()
+    fake_ffmpeg = _fake_executable(tmp_path)
+    monkeypatch.setattr(common, "REPO_ROOT", tmp_path / "missing-repo")
+    monkeypatch.setenv("HOME", str(fake_home))
+    monkeypatch.setenv("USERPROFILE", str(fake_home))
+    monkeypatch.setattr(
+        doctor, "find_ffmpeg", lambda: (str(fake_ffmpeg), "system")
+    )
+    monkeypatch.setattr(doctor, "_can_import", lambda _name: True)
+
+    exit_code = doctor.main(["--json"] if json_mode else [])
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert "Traceback" not in captured.out + captured.err
+    if json_mode:
+        payload = json.loads(captured.out)
+        assert set(payload) == EXPECTED_KEYS
+        assert "复制 config.example.json 为 config.json 可自定义" in captured.err
+    else:
+        assert "复制 config.example.json 为 config.json 可自定义" in captured.out
+        assert "✅ Python" in captured.out
+        assert captured.err == ""
+
+
 def test_invalid_config_still_outputs_diagnostic_json(
     tmp_path, monkeypatch, capsys
 ):
