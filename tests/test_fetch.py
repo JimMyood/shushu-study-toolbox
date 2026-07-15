@@ -1705,6 +1705,130 @@ def test_cli_video_parks_source_swapped_during_empty_publish(
     assert "parked" in captured.err
 
 
+@pytest.mark.parametrize(
+    "reverse_order",
+    [False, True],
+    ids=["video-then-metadata", "metadata-then-video"],
+)
+@pytest.mark.parametrize(
+    "existing_pair",
+    [False, True],
+    ids=["empty-slots", "existing-pair"],
+)
+def test_cli_video_rejects_first_final_replaced_during_second_publish(
+    tmp_path,
+    monkeypatch,
+    capsys,
+    reverse_order,
+    existing_pair,
+):
+    fetch = _fetch_module()
+    output_dir = tmp_path / "out"
+    output_dir.mkdir()
+    video_path = output_dir / "video.mp4"
+    metadata_path = output_dir / "meta.json"
+    old_video = b"OLD_VIDEO"
+    old_metadata = b"OLD_METADATA"
+    if existing_pair:
+        video_path.write_bytes(old_video)
+        metadata_path.write_bytes(old_metadata)
+
+    info = {"title": "new concurrent lesson"}
+    url = "https://example.test/video"
+    factory, _state = _fake_ydl(info)
+    competitor = output_dir / "competing-final.tmp"
+    competing_content = b"CONCURRENT_FINAL_CONTENT"
+    competitor.write_bytes(competing_content)
+
+    real_publish = fetch._publish_transaction
+    if reverse_order:
+
+        def publish_in_reverse(
+            staged_and_final,
+            initial_states,
+            staging_dir,
+            label,
+        ):
+            return real_publish(
+                tuple(reversed(staged_and_final)),
+                initial_states,
+                staging_dir,
+                label,
+            )
+
+        monkeypatch.setattr(
+            fetch,
+            "_publish_transaction",
+            publish_in_reverse,
+        )
+
+    first_final = metadata_path if reverse_order else video_path
+    second_final = video_path if reverse_order else metadata_path
+    real_park = fetch._replace_source_with_parked
+    swap = {"done": False}
+
+    def replace_first_final_during_second_publish(source, parked):
+        source = Path(source)
+        is_second_staged_source = (
+            source.parent.name == "new"
+            and (
+                source.name == "video.mp4"
+                if reverse_order
+                else source.name.startswith(".meta-")
+            )
+        )
+        if not swap["done"] and is_second_staged_source:
+            assert first_final.is_file()
+            os.replace(competitor, first_final)
+            swap["done"] = True
+        return real_park(source, parked)
+
+    monkeypatch.setattr(
+        fetch,
+        "_replace_source_with_parked",
+        replace_first_final_during_second_publish,
+    )
+
+    exit_code = fetch.main(
+        ["video", url, "--out", str(output_dir)],
+        ydl_factory=factory,
+    )
+
+    captured = capsys.readouterr()
+    recovery_dirs = list(output_dir.glob(".fetch-*"))
+    assert swap["done"] is True
+    assert exit_code == 1
+    assert first_final.read_bytes() == competing_content
+    assert len(recovery_dirs) == 1
+
+    recovery_dir = recovery_dirs[0]
+    if existing_pair:
+        assert second_final.read_bytes() == (
+            old_video if reverse_order else old_metadata
+        )
+        assert (
+            recovery_dir / "backups" / "video.mp4"
+        ).read_bytes() == old_video
+        assert (
+            recovery_dir / "backups" / "meta.json"
+        ).read_bytes() == old_metadata
+    else:
+        assert not second_final.exists()
+
+    first_new_content = (
+        fetch._metadata_bytes(info, url)
+        if reverse_order
+        else b"fake-mp4"
+    )
+    assert first_new_content in [
+        path.read_bytes()
+        for path in recovery_dir.rglob("*")
+        if path.is_file()
+    ]
+    assert str(recovery_dir) in captured.err
+    assert "Traceback" not in captured.out + captured.err
+
+
 def test_cli_subs_parks_source_swapped_during_empty_publish(
     tmp_path, monkeypatch, capsys
 ):

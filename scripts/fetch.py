@@ -868,6 +868,16 @@ def _publish_transaction(
             raise _ParkedSourceConflict(
                 "发布结束时 source 或 parked 出现未知目录项"
             )
+        # 这是成功返回前的最后一轮观测；final 必须仍逐一对应本次
+        # staged inode，不能仅凭 source/parked 中没有未知项判定成功。
+        for staged_path, final_path in staged_and_final:
+            if (
+                _entry_identity(final_path)
+                != staged_identities[staged_path]
+            ):
+                raise _TransactionConflict(
+                    "发布结束时 final 槽位身份发生变化"
+                )
         return
     except BaseException as error:
         # 这个 guard 覆盖 link/park 以及所有 mutation 后的身份观测；

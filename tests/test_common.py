@@ -16,6 +16,34 @@ def test_sanitize_truncates_to_80():
 @pytest.mark.parametrize(
     ("raw", "expected"),
     [
+        (
+            "CON." + "x" * 76,
+            "_CON." + "x" * 75,
+        ),
+        (
+            "CON." + "x" * 72 + ".txt",
+            "_CON." + "x" * 71 + ".txt",
+        ),
+    ],
+)
+def test_sanitize_reserved_80_character_name_stays_within_limit(
+    raw, expected
+):
+    assert len(raw) == 80
+    sanitized = common.sanitize_filename(raw)
+    assert sanitized == expected
+    assert len(sanitized) <= 80
+
+
+def test_sanitize_keeps_non_reserved_80_character_name_and_extension():
+    raw = "lesson-" + "x" * 70 + ".md"
+    assert len(raw) == 80
+    assert common.sanitize_filename(raw) == raw
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
         ("CON", "_CON"),
         ("con.txt", "_con.txt"),
         ("PRN.notes.md", "_PRN.notes.md"),

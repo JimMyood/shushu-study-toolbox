@@ -76,7 +76,16 @@ def sanitize_filename(name: str) -> str:
     cleaned = " ".join(cleaned.split()).rstrip(" .")[:80].rstrip(" .")
     device_name = cleaned.partition(".")[0].upper()
     if device_name in _WINDOWS_RESERVED_NAMES:
-        return f"_{cleaned}"
+        prefixed = f"_{cleaned}"
+        if len(prefixed) <= 80:
+            return prefixed
+
+        stem, separator, extension = prefixed.rpartition(".")
+        stem_limit = 80 - len(separator) - len(extension)
+        protected_device_length = len(prefixed.partition(".")[0])
+        if separator and stem_limit >= protected_device_length:
+            return f"{stem[:stem_limit]}{separator}{extension}"
+        return prefixed[:80]
     return cleaned
 
 
