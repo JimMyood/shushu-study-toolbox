@@ -52,9 +52,41 @@ def test_load_config_explains_invalid_config(
     assert "请修正该文件" in message
     assert "复制 config.example.json 为 config.json" in message
 
-def test_load_config_process_error_has_no_traceback(tmp_path):
+
+@pytest.mark.parametrize("failure_kind", ["invalid_utf8", "unreadable"])
+def test_load_config_translates_read_failures_to_actionable_chinese(
+    tmp_path, monkeypatch, failure_kind
+):
     config_path = tmp_path / "config.json"
-    config_path.write_text("{", encoding="utf-8")
+    if failure_kind == "invalid_utf8":
+        config_path.write_bytes(b'{"native_lang":"\xff"}')
+    else:
+        config_path.mkdir()
+    monkeypatch.setattr(common, "REPO_ROOT", tmp_path)
+
+    with pytest.raises(SystemExit) as error:
+        common.load_config()
+
+    message = str(error.value)
+    assert str(config_path) in message
+    assert "无法读取" in message
+    assert "UTF-8" in message
+    assert "当前用户可读" in message
+    assert "复制 config.example.json 为 config.json" in message
+    assert "UnicodeDecodeError" not in message
+    assert "IsADirectoryError" not in message
+
+@pytest.mark.parametrize(
+    "failure_kind", ["invalid_json", "invalid_utf8", "unreadable"]
+)
+def test_load_config_process_error_has_no_traceback(tmp_path, failure_kind):
+    config_path = tmp_path / "config.json"
+    if failure_kind == "invalid_json":
+        config_path.write_text("{", encoding="utf-8")
+    elif failure_kind == "invalid_utf8":
+        config_path.write_bytes(b'{"native_lang":"\xff"}')
+    else:
+        config_path.mkdir()
     scripts_dir = Path(common.__file__).resolve().parent
     command = (
         "from pathlib import Path\n"
@@ -83,9 +115,11 @@ def test_load_config_process_error_has_no_traceback(tmp_path):
 
     assert result.returncode != 0
     assert str(config_path) in result.stderr
-    assert "请修正该文件" in result.stderr
+    assert "请" in result.stderr
     assert "复制 config.example.json 为 config.json" in result.stderr
     assert "Traceback" not in result.stderr
+    assert "UnicodeDecodeError" not in result.stderr
+    assert "IsADirectoryError" not in result.stderr
 
 def test_item_dir_expands_home_and_creates(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(tmp_path))
@@ -391,3 +425,32 @@ def test_readme_script_examples_use_prepare_and_config_values():
     assert '--out "<item_dir>"' in readme
     assert "$HOME/ShushuStudy/example" not in readme
     assert "--quality 1080" not in readme
+
+
+def test_readme_setup_selects_supported_transcription_python_before_venv():
+    repo_root = Path(__file__).resolve().parent.parent
+    readme = (repo_root / "README.md").read_text(encoding="utf-8")
+
+    assert "Python 3.10–3.13" in readme
+    assert "Python 3.13 is recommended" in readme
+    assert "py -0p" in readme
+    assert "PYTHON_BIN" in readme
+    assert "PYTHON_VERSION" in readme
+    assert "python3.13 -m venv" not in readme
+    assert "py -3.13 -m venv" not in readme
+    assert "source .venv/bin/activate\npython -m pip" in readme
+    assert ".venv\\Scripts\\activate\npython -m pip" in readme
+
+
+def test_skill_and_manuals_use_active_python_and_version_aware_exit4():
+    repo_root = Path(__file__).resolve().parent.parent
+    paths = [repo_root / "SKILL.md", *sorted((repo_root / "tools").glob("*.md"))]
+    contents = {path.name: path.read_text(encoding="utf-8") for path in paths}
+
+    for name, content in contents.items():
+        assert "python3 scripts/" not in content, name
+        assert "python3 -m" not in content, name
+        assert "py -3.13" not in content, name
+    subtitle = contents["subtitle.md"]
+    assert "与当前解释器匹配的恢复指引" in subtitle
+    assert "Python 3.13 指引" not in subtitle

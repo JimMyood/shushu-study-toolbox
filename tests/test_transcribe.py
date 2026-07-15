@@ -72,7 +72,7 @@ def test_estimate_small_model_takes_thirty_percent_of_realtime():
     assert transcribe.estimate_minutes(600, "small") == 3
 
 
-def test_missing_faster_whisper_cli_exits_four_with_python_313_guidance(
+def test_missing_faster_whisper_cli_exits_four_with_version_aware_guidance(
     tmp_path,
 ):
     blocked_dependency = tmp_path / "blocked-dependency"
@@ -111,14 +111,13 @@ def test_missing_faster_whisper_cli_exits_four_with_python_313_guidance(
 
     assert result.returncode == 4
     assert "转写功能不可用" in result.stderr
-    assert "Python 3.13" in result.stderr
-    assert "venv" in result.stderr
-    if sys.platform == "darwin":
-        assert "brew install python@3.13" in result.stderr
-    elif sys.platform.startswith("win"):
-        assert "winget install Python.Python.3.13" in result.stderr
+    if (3, 10) <= sys.version_info[:2] < (3, 14):
+        assert "当前激活 venv" in result.stderr
+        assert "python -m pip install -r requirements.txt" in result.stderr
+        assert "Python 3.14 暂无" not in result.stderr
     else:
-        assert "sudo apt install python3.13 python3.13-venv" in result.stderr
+        assert "Python 3.10–3.13" in result.stderr
+        assert "推荐 Python 3.13" in result.stderr
     assert "Traceback" not in result.stderr
 
 
@@ -264,7 +263,7 @@ def test_auto_language_becomes_none_and_estimate_prints_before_model(
     monkeypatch.setattr(transcribe, "probe_duration", lambda _path: 600)
     state = _install_fake_whisper(
         monkeypatch,
-        [],
+        [SimpleNamespace(start=0.0, end=1.0, text="hello")],
         before_transcribe=lambda: capsys.readouterr().out,
     )
 
@@ -292,7 +291,10 @@ def test_explicit_language_is_passed_to_model(tmp_path, monkeypatch):
     transcribe = _load_transcribe()
     audio_path, output_path = _success_paths(tmp_path)
     monkeypatch.setattr(transcribe, "probe_duration", lambda _path: 60)
-    state = _install_fake_whisper(monkeypatch, [])
+    state = _install_fake_whisper(
+        monkeypatch,
+        [SimpleNamespace(start=0.0, end=1.0, text="hello")],
+    )
 
     exit_code = transcribe.main(
         [
@@ -349,7 +351,10 @@ def test_output_parent_directories_are_created(tmp_path, monkeypatch):
     transcribe = _load_transcribe()
     audio_path, output_path = _success_paths(tmp_path)
     monkeypatch.setattr(transcribe, "probe_duration", lambda _path: 5)
-    _install_fake_whisper(monkeypatch, [])
+    _install_fake_whisper(
+        monkeypatch,
+        [SimpleNamespace(start=0.0, end=1.0, text="hello")],
+    )
 
     exit_code = transcribe.main(
         [str(audio_path), "--out", str(output_path)]
@@ -359,18 +364,125 @@ def test_output_parent_directories_are_created(tmp_path, monkeypatch):
     assert output_path.is_file()
 
 
-def test_empty_segments_write_an_empty_srt(tmp_path, monkeypatch):
+@pytest.mark.parametrize(
+    "segments",
+    [
+        [],
+        [SimpleNamespace(start=0.0, end=1.0, text="   \n")],
+    ],
+)
+def test_no_usable_speech_fails_and_preserves_old_output(
+    tmp_path, monkeypatch, capsys, segments
+):
     transcribe = _load_transcribe()
     audio_path, output_path = _success_paths(tmp_path)
+    output_path.parent.mkdir(parents=True)
+    output_path.write_bytes(b"irreplaceable old subtitles")
     monkeypatch.setattr(transcribe, "probe_duration", lambda _path: 5)
-    _install_fake_whisper(monkeypatch, [])
+    _install_fake_whisper(monkeypatch, segments)
 
     exit_code = transcribe.main(
         [str(audio_path), "--out", str(output_path)]
     )
 
-    assert exit_code == 0
-    assert output_path.read_text(encoding="utf-8") == ""
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert "未识别到可用语音" in captured.err
+    assert "转写完成" not in captured.out + captured.err
+    assert "Traceback" not in captured.out + captured.err
+    assert output_path.read_bytes() == b"irreplaceable old subtitles"
+    assert set(output_path.parent.iterdir()) == {output_path}
+
+
+def test_blank_segments_are_filtered_and_indices_are_contiguous(
+    tmp_path, monkeypatch
+):
+    transcribe = _load_transcribe()
+    audio_path, output_path = _success_paths(tmp_path)
+    monkeypatch.setattr(transcribe, "probe_duration", lambda _path: 5)
+    _install_fake_whisper(
+        monkeypatch,
+        [
+            SimpleNamespace(start=0.0, end=0.5, text="  "),
+            SimpleNamespace(start="1.0", end="2.25", text=" first "),
+            SimpleNamespace(start=2.5, end=3.0, text="\n\t"),
+            SimpleNamespace(start=3.25, end=4.0, text="second"),
+        ],
+    )
+
+    assert transcribe.main(
+        [str(audio_path), "--out", str(output_path)]
+    ) == 0
+
+    subtitles = list(srt.parse(output_path.read_text(encoding="utf-8")))
+    assert [item.index for item in subtitles] == [1, 2]
+    assert [item.content for item in subtitles] == ["first", "second"]
+    assert subtitles[0].start == timedelta(seconds=1)
+
+
+@pytest.mark.parametrize(
+    "segment",
+    [
+        SimpleNamespace(start=0.0, end=1.0, text=None),
+        SimpleNamespace(start=0.0, end=1.0, text=123),
+        SimpleNamespace(start="nope", end=1.0, text="text"),
+        SimpleNamespace(start=float("nan"), end=1.0, text="text"),
+        SimpleNamespace(start=0.0, end=float("inf"), text="text"),
+        SimpleNamespace(start=-0.1, end=1.0, text="text"),
+        SimpleNamespace(start=1.0, end=1.0, text="text"),
+        SimpleNamespace(start=2.0, end=1.0, text="text"),
+    ],
+)
+def test_invalid_segment_fails_without_replacing_old_output_or_leaking_detail(
+    tmp_path, monkeypatch, capsys, segment
+):
+    transcribe = _load_transcribe()
+    audio_path, output_path = _success_paths(tmp_path)
+    output_path.parent.mkdir(parents=True)
+    output_path.write_bytes(b"old target must survive")
+    monkeypatch.setattr(transcribe, "probe_duration", lambda _path: 5)
+    _install_fake_whisper(monkeypatch, [segment])
+
+    exit_code = transcribe.main(
+        [str(audio_path), "--out", str(output_path)]
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert "转写结果无效" in captured.err
+    assert "请" in captured.err
+    assert "转写完成" not in captured.out + captured.err
+    assert "nope" not in captured.err
+    assert "Traceback" not in captured.out + captured.err
+    assert output_path.read_bytes() == b"old target must survive"
+    assert set(output_path.parent.iterdir()) == {output_path}
+
+
+def test_non_monotonic_segment_start_fails_and_preserves_old_output(
+    tmp_path, monkeypatch, capsys
+):
+    transcribe = _load_transcribe()
+    audio_path, output_path = _success_paths(tmp_path)
+    output_path.parent.mkdir(parents=True)
+    output_path.write_text("old", encoding="utf-8")
+    monkeypatch.setattr(transcribe, "probe_duration", lambda _path: 5)
+    _install_fake_whisper(
+        monkeypatch,
+        [
+            SimpleNamespace(start=2.0, end=3.0, text="later"),
+            SimpleNamespace(start=1.0, end=1.5, text="earlier"),
+        ],
+    )
+
+    exit_code = transcribe.main(
+        [str(audio_path), "--out", str(output_path)]
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert "转写结果无效" in captured.err
+    assert output_path.read_text(encoding="utf-8") == "old"
+    assert set(output_path.parent.iterdir()) == {output_path}
 
 
 def test_missing_input_exits_one_before_probe_or_model(
@@ -536,6 +648,8 @@ def test_model_errors_exit_one_without_internal_details(
 ):
     transcribe = _load_transcribe()
     audio_path, output_path = _success_paths(tmp_path)
+    output_path.parent.mkdir(parents=True)
+    output_path.write_bytes(b"old output")
     monkeypatch.setattr(transcribe, "probe_duration", lambda _path: 12)
     error = RuntimeError(f"secret {failure_stage} failure")
     _install_fake_whisper(
@@ -557,7 +671,8 @@ def test_model_errors_exit_one_without_internal_details(
     assert "请" in captured.err
     assert "secret" not in captured.err
     assert "Traceback" not in captured.out + captured.err
-    assert not output_path.exists()
+    assert output_path.read_bytes() == b"old output"
+    assert set(output_path.parent.iterdir()) == {output_path}
 
 
 def test_output_directory_error_exits_one_without_starting_model(

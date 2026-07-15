@@ -1,4 +1,5 @@
 import json
+import subprocess
 from pathlib import Path
 import sys
 from types import ModuleType, SimpleNamespace
@@ -127,6 +128,119 @@ def test_invalid_config_human_report_has_no_traceback(
     assert "✅ ffmpeg" in captured.out
     assert "✅ faster-whisper" in captured.out
     assert "❌ config.json 的 output_dir 配置无效" in captured.out
+
+
+@pytest.mark.parametrize("json_mode", [False, True])
+@pytest.mark.parametrize("failure_kind", ["invalid_utf8", "unreadable"])
+def test_unreadable_config_degrades_cleanly_in_both_doctor_modes(
+    tmp_path, monkeypatch, capsys, json_mode, failure_kind
+):
+    config_path = tmp_path / "config.json"
+    if failure_kind == "invalid_utf8":
+        config_path.write_bytes(b'{"output_dir":"\xff"}')
+    else:
+        config_path.mkdir()
+    fake_ffmpeg = _fake_executable(tmp_path)
+
+    monkeypatch.setattr(common, "REPO_ROOT", tmp_path)
+    monkeypatch.setattr(
+        doctor, "find_ffmpeg", lambda: (str(fake_ffmpeg), "system")
+    )
+    monkeypatch.setattr(doctor, "_can_import", lambda _name: True)
+
+    exit_code = doctor.main(["--json"] if json_mode else [])
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert str(config_path) in captured.err
+    assert "无法读取" in captured.err
+    assert "UTF-8" in captured.err
+    assert "UnicodeDecodeError" not in captured.err
+    assert "IsADirectoryError" not in captured.err
+    assert "Traceback" not in captured.out + captured.err
+    if json_mode:
+        payload = json.loads(captured.out)
+        assert set(payload) == EXPECTED_KEYS
+        assert payload == {
+            "python": True,
+            "yt_dlp": True,
+            "ffmpeg": "system",
+            "faster_whisper": True,
+            "output_dir_writable": False,
+        }
+    else:
+        assert "✅ yt-dlp" in captured.out
+        assert "✅ ffmpeg" in captured.out
+        assert "❌ config.json 的 output_dir 配置无效" in captured.out
+
+
+@pytest.mark.parametrize("json_mode", [False, True])
+@pytest.mark.parametrize("failure_kind", ["invalid_utf8", "unreadable"])
+def test_doctor_subprocess_has_no_traceback_for_unreadable_config(
+    tmp_path, json_mode, failure_kind
+):
+    config_path = tmp_path / "config.json"
+    if failure_kind == "invalid_utf8":
+        config_path.write_bytes(b'{"output_dir":"\xff"}')
+    else:
+        config_path.mkdir()
+    command = (
+        "from pathlib import Path\n"
+        "import sys\n"
+        "sys.path.insert(0, sys.argv[1])\n"
+        "import common, doctor\n"
+        "common.REPO_ROOT = Path(sys.argv[2])\n"
+        "args = ['--json'] if sys.argv[3] == 'json' else []\n"
+        "raise SystemExit(doctor.main(args))\n"
+    )
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-X",
+            "utf8",
+            "-c",
+            command,
+            str(SCRIPTS_DIR),
+            str(tmp_path),
+            "json" if json_mode else "human",
+        ],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        check=False,
+    )
+
+    assert result.returncode == 1
+    assert str(config_path) in result.stderr
+    assert "无法读取" in result.stderr
+    assert "Traceback" not in result.stdout + result.stderr
+    assert "UnicodeDecodeError" not in result.stderr
+    assert "IsADirectoryError" not in result.stderr
+    if json_mode:
+        payload = json.loads(result.stdout)
+        assert set(payload) == EXPECTED_KEYS
+    else:
+        assert "Python" in result.stdout
+        assert "output_dir 配置无效" in result.stdout
+
+
+@pytest.mark.parametrize(
+    ("version", "required", "forbidden"),
+    [
+        ((3, 9, 19), "Python 3.10–3.13", "当前激活 venv"),
+        ((3, 11, 15), "当前激活 venv", "Python 3.14 暂无"),
+        ((3, 13, 7), "python -m pip install -r requirements.txt", "重建"),
+        ((3, 14, 6), "Python 3.10–3.13", "当前激活 venv 中安装"),
+    ],
+)
+def test_faster_whisper_guidance_matches_actual_interpreter(
+    version, required, forbidden
+):
+    message = doctor.faster_whisper_guidance(version)
+
+    assert required in message
+    assert forbidden not in message
 
 
 def test_nul_output_dir_degrades_to_false(tmp_path, monkeypatch, capsys):

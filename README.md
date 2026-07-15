@@ -1,11 +1,16 @@
 # Shushu Study Toolbox / 树树工具箱
 
-**English quick start:** Shushu Study Toolbox is an agent skill that turns public videos, subtitles, webpages, and PDFs into bilingual study materials without requiring an external API key. Python 3.13 is recommended. Replace `<your-github-username>`, then run:
+**English quick start:** Shushu Study Toolbox is an agent skill that turns public videos, subtitles, webpages, and PDFs into bilingual study materials without requiring an external API key. Local transcription supports Python 3.10–3.13; Python 3.13 is recommended. On macOS/Linux, replace both placeholders below. Set `PYTHON_BIN` to an interpreter that you have already checked is in that supported range, then run:
 
 ```bash
 git clone https://github.com/<your-github-username>/shushu-study-toolbox.git
 cd shushu-study-toolbox
-python3.13 -m venv .venv
+for candidate in python3.13 python3.12 python3.11 python3.10 python3; do
+  command -v "$candidate" >/dev/null && "$candidate" --version
+done
+PYTHON_BIN="<installed Python 3.10-3.13 executable>"
+"$PYTHON_BIN" --version
+"$PYTHON_BIN" -m venv .venv
 source .venv/bin/activate
 python -m pip install -r requirements.txt
 cp config.example.json config.json
@@ -41,7 +46,7 @@ python scripts/doctor.py
 
 ## 三步安装
 
-推荐使用 **Python 3.13**。项目要求 Python 3.10 或更高版本，但 Python 3.14 目前无法安装 `faster-whisper`；它仍可使用下载、来源字幕、翻译、嵌字幕、笔记和资料精读功能。
+项目基础功能要求 Python 3.10 或更高版本；本地转写明确支持 **Python 3.10–3.13**，其中推荐 Python 3.13。Python 3.14 目前无法安装 `faster-whisper`，但仍可使用下载、来源字幕、翻译、嵌字幕、笔记和资料精读功能。
 
 ### 1. Clone 仓库
 
@@ -57,7 +62,14 @@ cd shushu-study-toolbox
 macOS / Linux：
 
 ```bash
-python3.13 -m venv .venv
+# 先列出本机实际存在的候选解释器及版本。
+for candidate in python3.13 python3.12 python3.11 python3.10 python3; do
+  command -v "$candidate" >/dev/null && "$candidate" --version
+done
+# 再把占位符换成上面实际列出且版本属于 3.10–3.13 的命令。
+PYTHON_BIN="<实际存在的 Python 3.10-3.13 命令>"
+"$PYTHON_BIN" --version
+"$PYTHON_BIN" -m venv .venv
 source .venv/bin/activate
 python -m pip install -r requirements.txt
 python scripts/doctor.py
@@ -66,13 +78,17 @@ python scripts/doctor.py
 Windows CMD：
 
 ```bat
-py -3.13 -m venv .venv
+py -0p
+rem 从上面的实际安装列表选择 3.10、3.11、3.12 或 3.13；推荐 3.13
+set PYTHON_VERSION=3.13
+py -%PYTHON_VERSION% --version
+py -%PYTHON_VERSION% -m venv .venv
 .venv\Scripts\activate
 python -m pip install -r requirements.txt
 python scripts\doctor.py
 ```
 
-doctor 全部显示 `✅` 且退出码为 0，说明 Python、yt-dlp、ffmpeg、faster-whisper 和输出目录均已就绪。只有 `faster-whisper` 未通过时，除本地转写外的能力仍可照常使用；本地转写需切换到 Python 3.13。
+doctor 全部显示 `✅` 且退出码为 0，说明 Python、yt-dlp、ffmpeg、faster-whisper 和输出目录均已就绪。只有 `faster-whisper` 未通过时，除本地转写外的能力仍可照常使用；如果当前是 Python 3.10–3.13，就在已激活环境中重新安装依赖；如果版本不在该范围，选择其中任一版本重建环境（推荐 3.13）。
 
 ### 3. 复制配置并接入 agent
 
@@ -145,7 +161,7 @@ python scripts/mux.py soft "<item_dir>/video.mp4" "<item_dir>/subs.bi.srt" --out
 
 ### Python 3.14 装不上 faster-whisper，怎么办？
 
-`requirements.txt` 会在 Python 3.14 跳过 `faster-whisper`，所以安装本身可以完成，但 doctor 会把本地转写标为不可用并返回 exit 1。推荐安装 Python 3.13，重新创建 `.venv` 后安装依赖。若暂时不转写，下载、获取来源字幕、字幕翻译、视频嵌字幕、笔记和资料精读都仍可使用。
+`requirements.txt` 会在 Python 3.14 跳过 `faster-whisper`，所以安装本身可以完成，但 doctor 会把本地转写标为不可用并返回 exit 1。请先用 `--version` 或 Windows 的 `py -0p` 确认本机实际解释器，再选择 Python 3.10–3.13 中任一版本重新创建 `.venv`（推荐 3.13）；激活后统一用 `python -m pip install -r requirements.txt` 安装依赖。若暂时不转写，下载、获取来源字幕、字幕翻译、视频嵌字幕、笔记和资料精读都仍可使用。
 
 ### 来源没有目标语言字幕（人工或自动）时，怎么办？
 

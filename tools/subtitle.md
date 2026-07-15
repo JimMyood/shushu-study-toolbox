@@ -93,8 +93,7 @@ python scripts/transcribe.py "$ITEM_DIR/audio.m4a" --model "$WHISPER_MODEL" --la
 - exit 0：确认屏幕先给出预计耗时，随后生成 `subs.orig.srt`。
 - exit 1：音频、ffprobe、模型或写入失败；按人话错误修复后再试。
 - exit 2：参数错误；核对输入文件及 `--model`、`--lang`、`--out`。
-- exit 4：当前 Python 没有可用的 faster-whisper；把屏幕中的 Python 3.13
-  安装与 venv 指引告诉用户，停止；绝不伪造字幕或转交未获许可的服务。
+- exit 4：当前 Python 没有可用的 faster-whisper；把屏幕中与当前解释器匹配的恢复指引告诉用户，停止。Python 3.10–3.13 应在当前已激活 venv 中重新安装依赖；只有版本在该范围外时才选择受支持解释器重建。绝不伪造字幕或转交未获许可的服务。
 - 其他 exit code：停止，并报告实际退出码。
 
 8. 无论抓取还是转写，最终都校验 SRT：
@@ -118,7 +117,7 @@ python scripts/srt_tools.py validate "$ITEM_DIR/subs.orig.srt"
 
 - `未找到 LANG 字幕`：这是 exit 3；先估时并询问，不能静默转写。
 - 可用语言与请求语言不同：请用户选择，不擅自换语言。
-- `faster-whisper` 不可用：按 exit 4 的 Python 3.13 指引处理。
+- `faster-whisper` 不可用：按 exit 4 中与当前解释器匹配的恢复指引处理，不把所有缺包情况都误报成 Python 版本不兼容。
 - `ffprobe` 无法读取：确认音频可播放并检查 ffmpeg/ffprobe。
 - 首次模型加载失败：保持网络畅通以下载模型后重试。
 - SRT 校验失败：保留原文件用于排查，不继续翻译或封装。

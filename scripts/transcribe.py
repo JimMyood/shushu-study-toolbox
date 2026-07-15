@@ -10,12 +10,20 @@ import sys
 import tempfile
 from typing import Sequence
 
-from doctor import _python_313_install_command, find_ffmpeg
+from doctor import faster_whisper_guidance, find_ffmpeg
 import srt
 
 
 class TranscribeError(Exception):
     """可安全展示给命令行用户的转写错误。"""
+
+
+class InvalidTranscriptionError(TranscribeError):
+    """模型返回的字幕字段不适合安全发布。"""
+
+
+class NoUsableSpeechError(TranscribeError):
+    """模型没有返回任何非空语音内容。"""
 
 
 class _ChineseArgumentParser(argparse.ArgumentParser):
@@ -137,6 +145,59 @@ def _paths_refer_to_same_file(input_path: Path, output_path: Path) -> bool:
         return False
 
 
+def _render_segments(segments) -> str:
+    subtitles = []
+    previous_start = None
+    iterator = iter(segments)
+    while True:
+        try:
+            segment = next(iterator)
+        except StopIteration:
+            break
+
+        try:
+            text = segment.text
+            if not isinstance(text, str):
+                raise InvalidTranscriptionError
+            content = text.strip()
+            if not content:
+                continue
+            start = float(segment.start)
+            end = float(segment.end)
+            if (
+                not math.isfinite(start)
+                or not math.isfinite(end)
+                or start < 0
+                or start >= end
+                or (previous_start is not None and start < previous_start)
+            ):
+                raise InvalidTranscriptionError
+            subtitle = srt.Subtitle(
+                index=len(subtitles) + 1,
+                start=timedelta(seconds=start),
+                end=timedelta(seconds=end),
+                content=content,
+            )
+        except InvalidTranscriptionError:
+            raise
+        except Exception:
+            raise InvalidTranscriptionError from None
+
+        subtitles.append(subtitle)
+        previous_start = start
+
+    if not subtitles:
+        raise NoUsableSpeechError(
+            "未识别到可用语音，未生成字幕。"
+            "请确认音频中有人声且可以正常播放后重试。"
+        )
+
+    try:
+        return srt.compose(subtitles, reindex=False)
+    except Exception:
+        raise InvalidTranscriptionError from None
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = _ChineseArgumentParser(description="本地音视频转写为 SRT")
     parser.add_argument("audio", type=Path)
@@ -150,18 +211,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
     whisper = _load_faster_whisper()
     if whisper is None:
-        install_command = _python_313_install_command()
-        venv_command = (
-            "py -3.13 -m venv .venv"
-            if sys.platform.startswith("win")
-            else "python3.13 -m venv .venv"
-        )
         print(
             "转写功能不可用：当前环境没有可用的 faster-whisper。"
-            "Python 3.14 暂无兼容版本；"
-            f"请先运行 `{install_command}` 安装 Python 3.13，"
-            f"再用 `{venv_command}` 创建 venv，"
-            "再在该环境中安装项目依赖后重试。",
+            f"{faster_whisper_guidance()}",
             file=sys.stderr,
         )
         return 4
@@ -213,16 +265,17 @@ def main(argv: Sequence[str] | None = None) -> int:
             str(args.audio),
             language=language,
         )
-        subtitles = [
-            srt.Subtitle(
-                index=index,
-                start=timedelta(seconds=segment.start),
-                end=timedelta(seconds=segment.end),
-                content=segment.text.strip(),
-            )
-            for index, segment in enumerate(segments, start=1)
-        ]
-        rendered_srt = srt.compose(subtitles, reindex=False)
+        rendered_srt = _render_segments(segments)
+    except NoUsableSpeechError as error:
+        print(str(error), file=sys.stderr)
+        return 1
+    except InvalidTranscriptionError:
+        print(
+            "转写结果无效：字幕文字或时间轴不符合要求。"
+            "请确认音频可播放后重试。",
+            file=sys.stderr,
+        )
+        return 1
     except Exception:
         print(
             "本地转写失败：模型加载或音频转写未完成。"

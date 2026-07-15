@@ -32,7 +32,16 @@ def load_config() -> dict:
         return DEFAULTS.copy()
 
     try:
-        user_config = json.loads(config_path.read_text(encoding="utf-8"))
+        raw_config = config_path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError):
+        raise SystemExit(
+            f"无法读取配置文件 {config_path}。"
+            "请确认它是 UTF-8 文本且当前用户可读，"
+            "或删除后复制 config.example.json 为 config.json。"
+        ) from None
+
+    try:
+        user_config = json.loads(raw_config)
     except json.JSONDecodeError:
         raise SystemExit(
             f"配置文件 {config_path} 不是有效的 JSON。"

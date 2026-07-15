@@ -66,12 +66,32 @@ def _ffmpeg_install_command() -> str:
     return "sudo apt install ffmpeg"
 
 
-def _python_313_install_command() -> str:
-    if sys.platform == "darwin":
-        return "brew install python@3.13"
-    if sys.platform.startswith("win"):
-        return "winget install Python.Python.3.13"
-    return "sudo apt install python3.13 python3.13-venv"
+def faster_whisper_guidance(
+    version_info: tuple[int, ...] | None = None,
+) -> str:
+    """按实际解释器给出不会误导用户的本地转写恢复步骤。"""
+    current = tuple(version_info or sys.version_info)
+    major_minor = current[:2]
+    version = ".".join(str(part) for part in current[:3])
+    if (3, 10) <= major_minor < (3, 14):
+        return (
+            f"当前 Python {version} 支持本地转写。"
+            "请在当前激活 venv 中运行 "
+            "`python -m pip install -r requirements.txt` 后重试；"
+            "不用转写功能可忽略。"
+        )
+    if major_minor >= (3, 14):
+        return (
+            f"当前 Python {version} 暂不支持 faster-whisper。"
+            "请选择 Python 3.10–3.13（推荐 Python 3.13）重新创建 venv，"
+            "激活后运行 `python -m pip install -r requirements.txt`；"
+            "不用转写功能可忽略。"
+        )
+    return (
+        f"当前 Python {version} 低于本地转写要求。"
+        "请选择 Python 3.10–3.13（推荐 Python 3.13）重新创建 venv，"
+        "激活后运行 `python -m pip install -r requirements.txt`。"
+    )
 
 
 def _collect_checks(config: dict) -> tuple[dict, str | None, Path | None]:
@@ -147,18 +167,8 @@ def _print_human_report(
 
     if checks["faster_whisper"]:
         print("✅ faster-whisper 可导入")
-    elif sys.version_info >= (3, 14):
-        print(
-            "❌ 转写功能不可用。Python 3.14 暂无该包，可 "
-            f"`{_python_313_install_command()}` 后用 3.13 建 venv；"
-            "不用转写功能可忽略。"
-        )
     else:
-        print(
-            "❌ 转写功能不可用。"
-            "请运行 `python -m pip install faster-whisper`；"
-            "不用转写功能可忽略。"
-        )
+        print(f"❌ 转写功能不可用。{faster_whisper_guidance()}")
 
     if checks["output_dir_writable"]:
         print(f"✅ 输出目录可写：{output_dir}")
