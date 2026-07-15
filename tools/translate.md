@@ -11,6 +11,7 @@
 
 - 在仓库根目录运行，并确认 `scripts/srt_tools.py` 可用。
 - 输入必须是 UTF-8 SRT，例如 `<ITEM_DIR>/subs.orig.srt`。
+- 以下代码块以 Bash/zsh 展示；PowerShell 请用实际值替换变量后逐条运行。
 - 从 `config.json` 读取 `native_lang` 与 `subtitle_layout`；默认分别为 `zh`
   和 `original-top`，不得假定用户一定使用中文。
 - 翻译由当前 agent 按块完成，不调用未获用户许可的外部服务。
@@ -59,11 +60,11 @@ python3 scripts/srt_tools.py chunk "$SOURCE_SRT" --size 40 --out-dir "$CHUNKS_DI
 - 每完成一块，立刻做行数自查：
 
 ```bash
-wc -l "$CHUNKS_DIR/chunk_000.txt" "$CHUNKS_DIR/chunk_000.zh.txt"
+python3 -c 'from pathlib import Path; import sys; a=Path(sys.argv[1]).read_text(encoding="utf-8").splitlines(); b=Path(sys.argv[2]).read_text(encoding="utf-8").splitlines(); ok=len(a)==len(b) and all(x.strip() for x in b); print(f"源文 {len(a)} 行，译文 {len(b)} 行，译文均非空：{ok}"); raise SystemExit(not ok)' "$CHUNKS_DIR/chunk_000.txt" "$CHUNKS_DIR/chunk_000.zh.txt"
 ```
 
-- 两个数字必须相同；再人工确认译文每行都非空。
-- 若行数不符，只修正当前 `.zh.txt`，不要改源分块。
+- exit 0：行数相同且译文每行非空；继续下一块。
+- exit 1：只修正当前 `.zh.txt` 的缺行、多余换行或空行，不改源分块。
 
 5. 中断后续跑时，先重新运行第 3 步，再读取 manifest。
 

@@ -11,6 +11,7 @@
 
 - 只处理用户提供或有权访问的网页、PDF 与个人学习用途内容。
 - 遵守来源版权与访问条款；不要绕过登录、付费墙或访问控制。
+- 以下代码块以 Bash/zsh 展示；PowerShell 请用实际值替换变量后逐条运行。
 - 从 `config.json` 读取 `native_lang`，正文以该语言为主。
 - 网页使用 agent 的 WebFetch 或浏览器读取；动态页面优先浏览器。
 - PDF 使用 Read 读取正文和相关页面；不要只根据文件名或摘要作答。
@@ -31,7 +32,7 @@
 
 ```bash
 ITEM_DIR="$HOME/ShushuStudy/2026-07-15-example"
-mkdir -p "$ITEM_DIR"
+python3 -c 'from pathlib import Path; import sys; Path(sys.argv[1]).mkdir(parents=True, exist_ok=True)' "$ITEM_DIR"
 python3 -c 'import sys; sys.path.insert(0,"scripts"); from common import load_config; print(load_config()["native_lang"])'
 ```
 
@@ -82,7 +83,7 @@ python3 -c 'import sys; sys.path.insert(0,"scripts"); from common import load_co
 7. 将结果保存为 Markdown 后检查文件：
 
 ```bash
-test -s "$ITEM_DIR/digest.md"
+python3 -c 'from pathlib import Path; import sys; p=Path(sys.argv[1]); ok=p.is_file() and p.stat().st_size>0; print("文件存在且非空" if ok else "文件缺失或为空"); raise SystemExit(not ok)' "$ITEM_DIR/digest.md"
 ```
 
 - exit 0：文件存在且非空，再向用户报告读取范围与模式。
@@ -91,7 +92,7 @@ test -s "$ITEM_DIR/digest.md"
 8. 双语摘要额外检查三个固定标题：
 
 ```bash
-rg -n '^## (一句话核心|核心要点|原文金句)$' "$ITEM_DIR/digest.md"
+python3 -c 'from pathlib import Path; import sys; lines=Path(sys.argv[1]).read_text(encoding="utf-8").splitlines(); hs=["## 一句话核心","## 核心要点","## 原文金句"]; ok=all(lines.count(h)==1 for h in hs); print("摘要结构通过" if ok else "摘要结构缺失或重复"); raise SystemExit(not ok)' "$ITEM_DIR/digest.md"
 ```
 
 - exit 0：仍需人工确认三个标题各出现一次并核对引用。

@@ -12,13 +12,18 @@
 - 仅处理用户有权访问、下载和个人学习的公开素材。
 - 遵守来源平台的服务条款、版权规则和所在地法律。
 - 在仓库根目录运行命令；先完成 `config.json` 配置。
+- 以下代码块以 Bash/zsh 展示；PowerShell 请用实际值替换变量后逐条运行。
 - 首次使用先执行环境自检：
 
 ```bash
 python3 scripts/doctor.py
 ```
 
-- 自检 exit 0 才继续；exit 1 时按屏幕中的当前平台指引修复。
+- doctor exit 0：环境完整，可以继续下载。
+- doctor exit 1：逐项判断，不要把全量失败一律当作下载阻断。
+- 只有 `faster-whisper` 失败时可忽略；它只影响本地转写，不影响下载。
+- 下载必须保证 Python、yt-dlp 与输出目录可用；视频合并和音频提取还需
+  ffmpeg。任何本次下载所需项失败，都应先按当前平台指引修复。
 - 与用户确认下载模式：完整视频，或仅音频。
 - 与用户确认素材目录，例如 `$HOME/ShushuStudy/2026-07-15-example`。
 - 不把受限、会员专享或地区不可用内容伪装成下载成功。
@@ -30,7 +35,7 @@ python3 scripts/doctor.py
 ```bash
 URL='https://example.com/video'
 ITEM_DIR="$HOME/ShushuStudy/2026-07-15-example"
-mkdir -p "$ITEM_DIR"
+python3 -c 'from pathlib import Path; import sys; Path(sys.argv[1]).mkdir(parents=True, exist_ok=True)' "$ITEM_DIR"
 ```
 
 2. 下载完整视频时，按用户需要设置最高垂直分辨率：
@@ -72,7 +77,7 @@ python3 -m json.tool "$ITEM_DIR/meta.json"
 7. 最后列出本次目录，向用户回报实际文件而非预期文件：
 
 ```bash
-ls -lh "$ITEM_DIR"
+python3 -c 'from pathlib import Path; import sys; p=Path(sys.argv[1]); [print(f"{x.name}\t{x.stat().st_size} bytes") for x in sorted(p.iterdir()) if x.is_file()]' "$ITEM_DIR"
 ```
 
 ## 产物路径

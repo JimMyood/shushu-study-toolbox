@@ -11,6 +11,7 @@
 
 - 只根据已经读取的网页、字幕、文档或 `meta.json` 写作。
 - 优先读取通过校验的 `subs.bi.srt`，否则读取 `subs.orig.srt`。
+- 以下代码块以 Bash/zsh 展示；PowerShell 请用实际值替换变量后逐条运行。
 - 从 `config.json` 读取 `native_lang`；正文以该语言为主。
 - 关键术语使用「母语译名 (English Term)」双语对照。
 - 诚实不画饼；素材没有支持的事实不补写、不猜测。

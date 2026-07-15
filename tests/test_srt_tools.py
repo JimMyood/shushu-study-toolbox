@@ -545,6 +545,17 @@ def test_validate_catches_empty_cue(tmp_path):
     assert "Traceback" not in result.stderr
 
 
+def test_validate_rejects_empty_srt_without_traceback(tmp_path):
+    empty_srt = tmp_path / "empty.srt"
+    empty_srt.write_text("", encoding="utf-8")
+
+    result = _run_cli("validate", empty_srt)
+
+    assert result.returncode == 1
+    assert "SRT 文件没有字幕条目" in result.stderr
+    assert "Traceback" not in result.stderr
+
+
 def test_validate_rejects_unparseable_srt_without_traceback(tmp_path):
     malformed = tmp_path / "malformed.srt"
     malformed.write_text("这不是 SRT 字幕\n", encoding="utf-8")

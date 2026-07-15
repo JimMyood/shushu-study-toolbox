@@ -11,6 +11,7 @@
 
 - 在仓库根目录运行，并先执行 `python3 scripts/doctor.py`。
 - 准备 `<ITEM_DIR>/video.mp4` 与通过校验的 SRT 字幕。
+- 以下代码块以 Bash/zsh 展示；PowerShell 请用实际值替换变量后逐条运行。
 - 优先使用 `<ITEM_DIR>/subs.bi.srt`；只有用户明确要单语时才换文件。
 - 先问用户选择软字幕还是硬字幕，不替用户决定最终观看方式。
 - 软字幕可开关、处理快；播放器必须支持 MP4 的 mov_text 字幕流。
@@ -67,7 +68,7 @@ python3 scripts/mux.py burn "$VIDEO" "$SUBTITLE" --out "$ITEM_DIR/video.burn.mp4
 7. 检查最终文件存在且非空：
 
 ```bash
-test -s "$ITEM_DIR/video.soft.mp4"
+python3 -c 'from pathlib import Path; import sys; p=Path(sys.argv[1]); ok=p.is_file() and p.stat().st_size>0; print("文件存在且非空" if ok else "文件缺失或为空"); raise SystemExit(not ok)' "$ITEM_DIR/video.soft.mp4"
 ```
 
 - 上面用于软字幕产物；硬字幕时把文件名改为 `video.burn.mp4`。

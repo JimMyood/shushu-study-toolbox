@@ -235,6 +235,10 @@ def validate_subtitles(path: Path) -> int:
         print(f"SRT 解析失败：{path}（{error}）", file=sys.stderr)
         return 1
 
+    if not subtitles:
+        print(f"SRT 文件没有字幕条目：{path}", file=sys.stderr)
+        return 1
+
     previous = None
     for position, cue in enumerate(subtitles, start=1):
         if not cue.content.strip():

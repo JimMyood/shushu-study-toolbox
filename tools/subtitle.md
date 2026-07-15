@@ -11,6 +11,7 @@
 
 - 仅处理用户有权访问和用于个人学习的素材，并遵守平台服务条款。
 - 在仓库根目录运行；先执行 `python3 scripts/doctor.py`。
+- 以下代码块以 Bash/zsh 展示；PowerShell 请用实际值替换变量后逐条运行。
 - 准备来源链接、字幕语言代码与本次素材目录。
 - 语言代码示例：英文 `en`、简体中文 `zh-Hans`；以来源实际提供为准。
 - 先尝试来源字幕；禁止在 exit 3 后静默下载音频或启动转写。
@@ -25,7 +26,7 @@
 URL='https://example.com/video'
 LANG='en'
 ITEM_DIR="$HOME/ShushuStudy/2026-07-15-example"
-mkdir -p "$ITEM_DIR"
+python3 -c 'from pathlib import Path; import sys; Path(sys.argv[1]).mkdir(parents=True, exist_ok=True)' "$ITEM_DIR"
 ```
 
 2. 优先抓取来源字幕（官方字幕优先，其次来源自动字幕）：
@@ -45,13 +46,15 @@ python3 scripts/fetch.py subs "$URL" --lang "$LANG" --out "$ITEM_DIR"
 4. exit 3 时，先从来源页面或已有元数据取得可靠视频时长并计算 X。
 
 ```bash
-python3 -c 'import json,math,sys; d=json.load(open(sys.argv[1],encoding="utf-8"))["duration_s"]; print(math.ceil(float(d)*0.3/60))' "$ITEM_DIR/meta.json"
+python3 -c 'import json,math,sys; sys.excepthook=lambda *_: print("无法从 meta.json 读取有效的正数 duration_s；请改用浏览器读取来源时长。",file=sys.stderr); d=json.load(open(sys.argv[1],encoding="utf-8"))["duration_s"]; d=d if type(d) in (int,float) and math.isfinite(d) and d>0 else (_ for _ in ()).throw(ValueError()); print(math.ceil(d*0.3/60))' "$ITEM_DIR/meta.json"
 ```
 
 - 只有已有 `meta.json` 时才直接复制上面的命令。
-- 若没有元数据，使用浏览器读取来源标注时长，再按同一公式计算。
-- 若时长也无法取得，应明确说无法可靠估时并先询问，不得编造 X。
-- 向用户原样提问：「无官方字幕，转写约需 X 分钟，继续吗？」
+- exit 0：输出正整数 X；再原样问「无官方字幕，转写约需 X 分钟，继续吗？」
+- exit 1：缺字段、非数值、非有限值或非正数；中文报错且不泄露 traceback。
+- exit 1 或没有元数据时，改用浏览器读取来源标注时长并按同一公式计算。
+- 浏览器也无法取得时，问「无法可靠估时；仍要下载音频并本地转写吗？」
+- 不得把 0、NaN、缺失字段或猜测值填进 X。
 - 在用户明确回答继续之前，不能运行 audio 或 transcribe 命令。
 
 5. 用户确认后才下载音频：
