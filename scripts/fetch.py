@@ -868,8 +868,10 @@ def _publish_transaction(
             raise _ParkedSourceConflict(
                 "发布结束时 source 或 parked 出现未知目录项"
             )
-        # 这是成功返回前的最后一轮观测；final 必须仍逐一对应本次
-        # staged inode，不能仅凭 source/parked 中没有未知项判定成功。
+        # 最后一个 _move_noreplace 返回时，整组 final 首次完整存在，
+        # 这是本事务的 commit point。下面再做一轮逐项观测，用于
+        # 捕捉 commit point 前已开始的路径变化；它不是路径锁，也不
+        # 承诺外部进程在 commit point 后不会继续修改公开路径。
         for staged_path, final_path in staged_and_final:
             if (
                 _entry_identity(final_path)

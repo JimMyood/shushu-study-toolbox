@@ -424,8 +424,8 @@ def _rollback_isolations(
         record["restored"] = restored
 
     # 可移植文件 API 没有“仅当另一路径仍指向同一 inode 时才删除”的
-    # compare-and-unlink。回滚后也必须保留至少一个私有硬链接，否则源路径在
-    # 最后一次校验后被并发换包时，删除 parked 会让旧译文永久丢失。
+    # compare-and-unlink。因此回滚不自动删除已建立的私有载体；它可能
+    # 是旧译文，也可能是并发变化后被保留的目录项，失败时必须人工核对。
     return True, archive_dir
 
 
