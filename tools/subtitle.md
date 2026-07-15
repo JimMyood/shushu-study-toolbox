@@ -10,29 +10,39 @@
 ## 前置
 
 - 仅处理用户有权访问和用于个人学习的素材，并遵守平台服务条款。
-- 在仓库根目录运行；先执行 `python3 scripts/doctor.py`。
+- 在仓库根目录运行；先执行 `python scripts/doctor.py`。
 - 以下代码块以 Bash/zsh 展示；PowerShell 请用实际值替换变量后逐条运行。
-- 准备来源链接、字幕语言代码与本次素材目录。
+- 准备来源链接与真实标题；字幕语言、转写模型和素材目录必须来自
+  `common.py prepare` 返回的 JSON。
 - 语言代码示例：英文 `en`、简体中文 `zh-Hans`；以来源实际提供为准。
 - 先尝试来源字幕；禁止在 exit 3 后静默下载音频或启动转写。
-- 转写估时使用 small 模型粗估：`ceil(视频秒数 × 0.3 ÷ 60)` 分钟。
+- 转写估时使用配置模型的粗估系数；当前 tiny/small/medium 均先用
+  `ceil(视频秒数 × 0.3 ÷ 60)` 分钟作保守提示。
 - 视频时长只能读来源页面或已有 `meta.json`；不确定时不要猜。
 
 ## 步骤
 
-1. 设置真实链接、目标语言和素材目录：
+1. 设置真实链接和标题，调用统一配置入口：
 
 ```bash
 URL='https://example.com/video'
-LANG='en'
-ITEM_DIR="$HOME/ShushuStudy/2026-07-15-example"
-python3 -c 'from pathlib import Path; import sys; Path(sys.argv[1]).mkdir(parents=True, exist_ok=True)' "$ITEM_DIR"
+TITLE='素材的真实标题'
+python scripts/common.py prepare --title "$TITLE"
 ```
+
+- exit 0：只解析 stdout JSON，必须读取 `item_dir`、`output_dir`、
+  `native_lang`、`source_lang`、`whisper_model`、`video_quality` 和
+  `subtitle_layout` 全部七个字段。本手册把 `item_dir`、`source_lang`
+  和 `whisper_model` 分别记为 `ITEM_DIR`、`SOURCE_LANG` 和
+  `WHISPER_MODEL`，其余配置原样保留给后续流水线。
+- exit 1/2：修复配置、路径或参数后重试，不手工 `mkdir`。
+- 默认使用当天；需要指定日期时加 `--date 2026-07-15`。
+- 除非用户明确要求本次临时覆盖，下方命令必须使用这些真实配置值。
 
 2. 优先抓取来源字幕（官方字幕优先，其次来源自动字幕）：
 
 ```bash
-python3 scripts/fetch.py subs "$URL" --lang "$LANG" --out "$ITEM_DIR"
+python scripts/fetch.py subs "$URL" --lang "$SOURCE_LANG" --out "$ITEM_DIR"
 ```
 
 3. 必须按退出码分支，不能把失败当成功：
@@ -46,7 +56,7 @@ python3 scripts/fetch.py subs "$URL" --lang "$LANG" --out "$ITEM_DIR"
 4. exit 3 时，先从来源页面或已有元数据取得可靠视频时长并计算 X。
 
 ```bash
-python3 -c 'import json,math,sys; sys.excepthook=lambda *_: print("无法从 meta.json 读取有效的正数 duration_s；请改用浏览器读取来源时长。",file=sys.stderr); d=json.load(open(sys.argv[1],encoding="utf-8"))["duration_s"]; d=d if type(d) in (int,float) and math.isfinite(d) and d>0 else (_ for _ in ()).throw(ValueError()); print(math.ceil(d*0.3/60))' "$ITEM_DIR/meta.json"
+python -c 'import json,math,sys; sys.excepthook=lambda *_: print("无法从 meta.json 读取有效的正数 duration_s；请改用浏览器读取来源时长。",file=sys.stderr); d=json.load(open(sys.argv[1],encoding="utf-8"))["duration_s"]; d=d if type(d) in (int,float) and math.isfinite(d) and d>0 else (_ for _ in ()).throw(ValueError()); print(math.ceil(d*0.3/60))' "$ITEM_DIR/meta.json"
 ```
 
 - 只有已有 `meta.json` 时才直接复制上面的命令。
@@ -60,17 +70,18 @@ python3 -c 'import json,math,sys; sys.excepthook=lambda *_: print("无法从 met
 5. 用户确认后才下载音频：
 
 ```bash
-python3 scripts/fetch.py audio "$URL" --out "$ITEM_DIR"
+python scripts/fetch.py audio "$URL" --out "$ITEM_DIR"
 ```
 
 - exit 0：确认 `audio.m4a` 存在，再开始本地转写。
 - exit 1：报告下载错误并停止；不要转交外部转写服务。
 - exit 2：修正命令参数；其他退出码同样停止并报告。
 
-6. 用本地 small 模型转写，`--lang auto` 表示自动识别源语言：
+6. 用 JSON 中的本地模型和源语言转写；`SOURCE_LANG=auto` 时由
+   faster-whisper 自动识别：
 
 ```bash
-python3 scripts/transcribe.py "$ITEM_DIR/audio.m4a" --model small --lang auto --out "$ITEM_DIR/subs.orig.srt"
+python scripts/transcribe.py "$ITEM_DIR/audio.m4a" --model "$WHISPER_MODEL" --lang "$SOURCE_LANG" --out "$ITEM_DIR/subs.orig.srt"
 ```
 
 7. 本地转写的分支处理：
@@ -85,12 +96,12 @@ python3 scripts/transcribe.py "$ITEM_DIR/audio.m4a" --model small --lang auto --
 8. 无论抓取还是转写，最终都校验 SRT：
 
 ```bash
-python3 scripts/srt_tools.py validate "$ITEM_DIR/subs.orig.srt"
+python scripts/srt_tools.py validate "$ITEM_DIR/subs.orig.srt"
 ```
 
 - exit 0：报告字幕条数，流程完成。
 - exit 1：SRT 解析、空字幕或时间轴错误，不能进入翻译。
-- exit 2：命令参数错误，先查看 `python3 scripts/srt_tools.py --help`。
+- exit 2：命令参数错误，先查看 `python scripts/srt_tools.py --help`。
 
 ## 产物路径
 

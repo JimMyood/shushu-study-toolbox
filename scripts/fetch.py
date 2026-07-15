@@ -6,8 +6,10 @@ import json
 import math
 from pathlib import Path
 import re
+import shutil
 import socket
 import ssl
+import stat
 import sys
 import tempfile
 from typing import Callable, Sequence
@@ -43,6 +45,10 @@ class SubtitleUnavailable(FetchError):
         super().__init__(language)
         self.language = language
         self.available = available
+
+
+class _RecoveryRequired(FetchError):
+    """事务回滚未完成，临时目录必须保留给人工恢复。"""
 
 
 class _SilentLogger:
@@ -170,7 +176,11 @@ def _usable_languages(info: dict, field: str) -> list[str]:
     return sorted(
         language
         for language, formats in tracks.items()
-        if isinstance(language, str) and isinstance(formats, list) and formats
+        if isinstance(language, str)
+        and language.strip()
+        and language.casefold().replace("-", "_") != "live_chat"
+        and isinstance(formats, list)
+        and any(isinstance(item, dict) and item for item in formats)
     )
 
 
@@ -193,6 +203,9 @@ def _matching_language(languages: list[str], requested: str) -> str | None:
 
 def select_subtitle(info: dict, requested: str) -> tuple[str, str] | None:
     """按官方优先、自动字幕次之选择目标语言字幕。"""
+    if requested.casefold().replace("_", "-") == "auto":
+        return _select_source_language(info)
+
     for field, source in (
         ("subtitles", "official"),
         ("automatic_captions", "automatic"),
@@ -200,6 +213,60 @@ def select_subtitle(info: dict, requested: str) -> tuple[str, str] | None:
         language = _matching_language(
             _usable_languages(info, field), requested
         )
+        if language is not None:
+            return language, source
+    return None
+
+
+def _metadata_source_languages(info: dict) -> list[str]:
+    """读取 yt-dlp 可靠的原语言字段，并保持优先级。"""
+    languages = []
+    for field in (
+        "language",
+        "original_language",
+        "original_language_code",
+        "audio_language",
+    ):
+        value = info.get(field)
+        if isinstance(value, str) and value.strip():
+            normalized = value.strip()
+            if normalized.casefold() != "auto" and normalized not in languages:
+                languages.append(normalized)
+    return languages
+
+
+def _auto_language(languages: list[str], info: dict) -> str | None:
+    if not languages:
+        return None
+    for metadata_language in _metadata_source_languages(info):
+        matched = _matching_language(languages, metadata_language)
+        if matched is not None:
+            return matched
+    if len(languages) == 1:
+        return languages[0]
+    original_tracks = sorted(
+        (
+            language
+            for language in languages
+            if language.casefold().replace("_", "-").endswith("-orig")
+        ),
+        key=lambda value: (value.casefold().replace("_", "-"), value),
+    )
+    if original_tracks:
+        return original_tracks[0]
+    # 元数据不足时仍要给 agent 稳定、可重现的结果。
+    return min(
+        languages,
+        key=lambda value: (value.casefold().replace("_", "-"), value),
+    )
+
+
+def _select_source_language(info: dict) -> tuple[str, str] | None:
+    for field, source in (
+        ("subtitles", "official"),
+        ("automatic_captions", "automatic"),
+    ):
+        language = _auto_language(_usable_languages(info, field), info)
         if language is not None:
             return language, source
     return None
@@ -291,6 +358,129 @@ def _make_output_dir(out_dir: Path) -> Path:
     return destination
 
 
+def _slot_exists(path: Path) -> bool:
+    return path.exists() or path.is_symlink()
+
+
+def _preflight_slot(path: Path) -> None:
+    """只允许空槽位或现有普通文件，绝不跟随符号链接。"""
+    if path.is_symlink():
+        raise FetchError(
+            f"输出槽位 {path} 是符号链接，已拒绝覆盖。"
+            "请先移开该链接后重试。"
+        )
+    try:
+        mode = path.lstat().st_mode
+    except FileNotFoundError:
+        return
+    except OSError:
+        raise FetchError(
+            f"无法检查输出槽位 {path}。"
+            "请检查路径和权限后重试。"
+        ) from None
+    if stat.S_ISREG(mode):
+        return
+    kind = "目录" if stat.S_ISDIR(mode) else "特殊文件"
+    raise FetchError(
+        f"输出槽位 {path} 已是{kind}，已拒绝覆盖。"
+        "请先移开冲突项后重试。"
+    )
+
+
+def _preflight_slots(paths: Sequence[Path]) -> None:
+    for path in paths:
+        _preflight_slot(path)
+
+
+def _replace_file(source: Path, destination: Path) -> None:
+    """为事务测试提供单一、可替换的原子 rename 边界。"""
+    source.replace(destination)
+
+
+def _new_staging_dir(destination: Path) -> Path:
+    try:
+        return Path(tempfile.mkdtemp(prefix=".fetch-", dir=destination))
+    except OSError:
+        raise FetchError(
+            f"无法在输出目录 {destination} 创建临时区。"
+            "请检查权限和磁盘空间后重试。"
+        ) from None
+
+
+def _write_recovery_guide(staging_dir: Path) -> None:
+    guide = staging_dir / "RECOVERY.txt"
+    try:
+        guide.write_text(
+            "视频与元数据发布失败，自动回滚未完成。\n"
+            "1. 暂停重试下载，先备份本目录。\n"
+            "2. backups/ 中是发布前的旧文件；failed-new/ 中是未发布完整的新文件。\n"
+            "3. 核对输出目录中的 video.mp4 和 meta.json，"
+            "再将 backups/ 中缺失的旧文件移回。\n",
+            encoding="utf-8",
+        )
+    except OSError:
+        # 恢复资料本身比说明文件更重要；保留 staging 路径供人工检查。
+        pass
+
+
+def _publish_video_pair(
+    staged_video: Path,
+    staged_metadata: Path,
+    final_video: Path,
+    final_metadata: Path,
+    staging_dir: Path,
+) -> None:
+    """成对发布视频与元数据；任一步失败则恢复旧状态。"""
+    finals = (final_video, final_metadata)
+    staged = (staged_video, staged_metadata)
+    backups_dir = staging_dir / "backups"
+    failed_new_dir = staging_dir / "failed-new"
+    backups_dir.mkdir()
+    failed_new_dir.mkdir()
+    backed_up: list[tuple[Path, Path]] = []
+    published: list[Path] = []
+
+    try:
+        # 下载期间可能有外部程序改动槽位，发布前再检一次。
+        _preflight_slots(finals)
+        for final_path in finals:
+            if _slot_exists(final_path):
+                backup_path = backups_dir / final_path.name
+                _replace_file(final_path, backup_path)
+                backed_up.append((final_path, backup_path))
+        for staged_path, final_path in zip(staged, finals, strict=True):
+            _replace_file(staged_path, final_path)
+            published.append(final_path)
+    except FetchError:
+        raise
+    except OSError:
+        rollback_failed = False
+        for final_path in reversed(published):
+            try:
+                _replace_file(
+                    final_path, failed_new_dir / final_path.name
+                )
+            except OSError:
+                rollback_failed = True
+        for final_path, backup_path in reversed(backed_up):
+            try:
+                _replace_file(backup_path, final_path)
+            except OSError:
+                rollback_failed = True
+
+        if rollback_failed:
+            _write_recovery_guide(staging_dir)
+            raise _RecoveryRequired(
+                "视频与元数据发布失败，自动回滚也未完成。"
+                f"可恢复资料已保留在：{staging_dir}。"
+                "请暂停重试并查看其中的 RECOVERY.txt。"
+            ) from None
+        raise FetchError(
+            "视频与元数据发布失败，旧文件已恢复。"
+            "请检查输出目录权限和磁盘空间后重试。"
+        ) from None
+
+
 def _clean_subtitle_file(path: Path) -> None:
     try:
         subtitles = list(srt.parse(path.read_text(encoding="utf-8")))
@@ -328,31 +518,62 @@ def _download_media(
 ) -> tuple[Path, Path | None]:
     destination = _make_output_dir(out_dir)
     filename = "audio.m4a" if mode == "audio" else "video.mp4"
-    with tempfile.TemporaryDirectory(
-        prefix=".fetch-", dir=destination
-    ) as temporary_name:
-        temporary_dir = Path(temporary_name)
-        options = build_opts(mode, quality, temporary_dir)
+    final_path = destination / filename
+    metadata_path = destination / "meta.json" if mode == "video" else None
+    final_slots = (
+        (final_path, metadata_path)
+        if metadata_path is not None
+        else (final_path,)
+    )
+    _preflight_slots(final_slots)
+
+    staging_dir = _new_staging_dir(destination)
+    keep_staging = False
+    try:
+        new_dir = staging_dir / "new"
+        new_dir.mkdir()
+        options = build_opts(mode, quality, new_dir)
         info = _extract_info(factory, options, url, download=True)
-        downloaded_path = temporary_dir / filename
+        downloaded_path = new_dir / filename
         if not downloaded_path.is_file():
             raise FetchError(
                 f"下载已结束，但没有生成 {filename}。"
                 "请更新 yt-dlp 与 ffmpeg 后重试。"
             )
 
-        metadata_path = None
-        temporary_metadata = None
         if mode == "video":
-            temporary_metadata = temporary_dir / "meta.json"
+            temporary_metadata = new_dir / "meta.json"
             write_metadata(info, url, temporary_metadata)
-
-        final_path = destination / filename
-        downloaded_path.replace(final_path)
-        if temporary_metadata is not None:
-            metadata_path = destination / "meta.json"
-            temporary_metadata.replace(metadata_path)
+            _publish_video_pair(
+                downloaded_path,
+                temporary_metadata,
+                final_path,
+                metadata_path,
+                staging_dir,
+            )
+        else:
+            _preflight_slot(final_path)
+            try:
+                _replace_file(downloaded_path, final_path)
+            except OSError:
+                raise FetchError(
+                    "音频发布失败，原文件未改动。"
+                    "请检查输出目录权限和磁盘空间后重试。"
+                ) from None
         return final_path, metadata_path
+    except _RecoveryRequired:
+        keep_staging = True
+        raise
+    finally:
+        if not keep_staging:
+            try:
+                shutil.rmtree(staging_dir)
+            except FileNotFoundError:
+                pass
+            except OSError:
+                # 最终槽位不受清理失败影响；下次 preflight 也不会
+                # 把 .fetch-* 误当成成品。
+                pass
 
 
 def _download_subtitles(
@@ -360,13 +581,14 @@ def _download_subtitles(
     language: str,
     out_dir: Path,
     factory: YdlFactory,
-) -> Path:
+) -> tuple[Path, str, str]:
     destination = _make_output_dir(out_dir)
-    with tempfile.TemporaryDirectory(
-        prefix=".fetch-", dir=destination
-    ) as temporary_name:
-        temporary_dir = Path(temporary_name)
-        options = build_opts("subs", None, temporary_dir)
+    final_path = destination / "subs.orig.srt"
+    _preflight_slot(final_path)
+    staging_dir = _new_staging_dir(destination)
+    try:
+        new_dir = staging_dir
+        options = build_opts("subs", None, new_dir)
         with factory(_runtime_opts(options)) as downloader:
             info = downloader.extract_info(
                 url, download=False, process=False
@@ -393,7 +615,7 @@ def _download_subtitles(
 
         candidates = sorted(
             path
-            for path in temporary_dir.rglob("*.srt")
+            for path in new_dir.rglob("*.srt")
             if path.is_file() and not path.is_symlink()
         )
         if len(candidates) != 1:
@@ -402,9 +624,22 @@ def _download_subtitles(
                 "请更新 yt-dlp 与 ffmpeg 后重试。"
             )
         _clean_subtitle_file(candidates[0])
-        final_path = destination / "subs.orig.srt"
-        candidates[0].replace(final_path)
-        return final_path
+        _preflight_slot(final_path)
+        try:
+            _replace_file(candidates[0], final_path)
+        except OSError:
+            raise FetchError(
+                "字幕发布失败，原文件未改动。"
+                "请检查输出目录权限和磁盘空间后重试。"
+            ) from None
+        return final_path, selected_language, source
+    finally:
+        try:
+            shutil.rmtree(staging_dir)
+        except FileNotFoundError:
+            pass
+        except OSError:
+            pass
 
 
 def _quality(value: str) -> str:
@@ -446,8 +681,14 @@ def main(
     factory = ydl_factory or yt_dlp.YoutubeDL
     try:
         if args.command == "subs":
-            output_path = _download_subtitles(
+            output_path, selected_language, source = _download_subtitles(
                 args.url, args.lang, args.out, factory
+            )
+            source_label = (
+                "官方字幕" if source == "official" else "自动字幕"
+            )
+            print(
+                f"已选择来源字幕：{selected_language}（{source_label}）"
             )
             print(f"字幕已保存：{output_path}")
             return 0

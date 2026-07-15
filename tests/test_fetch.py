@@ -356,6 +356,86 @@ def test_select_subtitle_ignores_empty_tracks_and_reports_all_usable_languages()
     assert languages == ["fr", "ja"]
 
 
+def test_select_subtitle_auto_chooses_single_official_english_track():
+    fetch = _fetch_module()
+    info = {
+        "subtitles": {"en": [{"ext": "vtt"}]},
+        "automatic_captions": {},
+    }
+
+    assert fetch.select_subtitle(info, "auto") == ("en", "official")
+
+
+def test_select_subtitle_auto_matches_metadata_with_multiple_official_tracks():
+    fetch = _fetch_module()
+    info = {
+        "language": "en-US",
+        "subtitles": {
+            "fr": [{"ext": "vtt"}],
+            "en": [{"ext": "vtt"}],
+            "ja": [{"ext": "vtt"}],
+        },
+    }
+
+    assert fetch.select_subtitle(info, "auto") == ("en", "official")
+
+
+def test_select_subtitle_auto_prefers_official_over_automatic():
+    fetch = _fetch_module()
+    info = {
+        "original_language": "en",
+        "subtitles": {"fr": [{"ext": "vtt"}]},
+        "automatic_captions": {"en": [{"ext": "json3"}]},
+    }
+
+    assert fetch.select_subtitle(info, "auto") == ("fr", "official")
+
+
+def test_select_subtitle_auto_uses_unique_automatic_when_no_official():
+    fetch = _fetch_module()
+    info = {
+        "subtitles": {},
+        "automatic_captions": {"de": [{"ext": "json3"}]},
+    }
+
+    assert fetch.select_subtitle(info, "auto") == (
+        "de",
+        "automatic",
+    )
+
+
+def test_select_subtitle_auto_prefers_orig_track_without_metadata():
+    fetch = _fetch_module()
+    info = {
+        "automatic_captions": {
+            "fr": [{"ext": "json3"}],
+            "en-orig": [{"ext": "json3"}],
+            "ja": [{"ext": "json3"}],
+        }
+    }
+
+    assert fetch.select_subtitle(info, "auto") == (
+        "en-orig",
+        "automatic",
+    )
+
+
+def test_select_subtitle_auto_has_stable_fallback_and_excludes_live_chat():
+    fetch = _fetch_module()
+    info = {
+        "subtitles": {
+            "zh-Hant": [{"ext": "vtt"}],
+            "live_chat": [{"ext": "json"}],
+            "en": [{"ext": "vtt"}],
+            "": [{"ext": "vtt"}],
+        },
+        "automatic_captions": {"aa": [{"ext": "json3"}]},
+    }
+
+    assert fetch.select_subtitle(info, "auto") == ("en", "official")
+    assert fetch.available_subtitle_languages(info) == ["aa", "en", "zh-Hant"]
+
+
 def test_write_metadata_serializes_exact_schema_utf8_and_readable_date(
     tmp_path,
 ):
@@ -549,6 +629,82 @@ def test_cli_subs_rejects_all_blank_cues_preserves_existing_and_cleans_temp(
     assert set(output_dir.iterdir()) == {subtitle_path}
 
 
+def test_cli_subs_preflights_conflicting_final_slot_before_network(
+    tmp_path, capsys
+):
+    fetch = _fetch_module()
+    output_dir = tmp_path / "out"
+    output_dir.mkdir()
+    subtitle_slot = output_dir / "subs.orig.srt"
+    subtitle_slot.mkdir()
+    factory, state = _fake_ydl(
+        {"subtitles": {"en": [{"ext": "vtt"}]}}
+    )
+
+    exit_code = fetch.main(
+        [
+            "subs",
+            "https://example.test/video",
+            "--lang",
+            "en",
+            "--out",
+            str(output_dir),
+        ],
+        ydl_factory=factory,
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert state["instances"] == 0
+    assert state["calls"] == []
+    assert subtitle_slot.is_dir()
+    assert "subs.orig.srt" in captured.err
+    assert "目录" in captured.err
+    assert "Traceback" not in captured.out + captured.err
+
+
+def test_cli_subs_publish_failure_preserves_existing_regular_file(
+    tmp_path, monkeypatch, capsys
+):
+    fetch = _fetch_module()
+    output_dir = tmp_path / "out"
+    output_dir.mkdir()
+    subtitle_path = output_dir / "subs.orig.srt"
+    previous = b"old subtitle bytes"
+    subtitle_path.write_bytes(previous)
+    factory, _state = _fake_ydl(
+        {"subtitles": {"en": [{"ext": "vtt"}]}}
+    )
+    real_replace = fetch._replace_file
+
+    def fail_subtitle_publish(source, destination):
+        if destination == subtitle_path:
+            raise OSError("secret subtitle publish failure")
+        return real_replace(source, destination)
+
+    monkeypatch.setattr(fetch, "_replace_file", fail_subtitle_publish)
+
+    exit_code = fetch.main(
+        [
+            "subs",
+            "https://example.test/video",
+            "--lang",
+            "en",
+            "--out",
+            str(output_dir),
+        ],
+        ydl_factory=factory,
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert subtitle_path.read_bytes() == previous
+    assert list(output_dir.glob(".fetch-*")) == []
+    assert "字幕发布失败" in captured.err
+    assert "secret" not in captured.out + captured.err
+    assert "Traceback" not in captured.out + captured.err
+
+
 def test_cli_subs_uses_automatic_caption_only_after_official_miss(
     tmp_path,
 ):
@@ -577,6 +733,33 @@ def test_cli_subs_uses_automatic_caption_only_after_official_miss(
     download_options = state["options"][0]
     assert download_options["writesubtitles"] is False
     assert download_options["writeautomaticsub"] is True
+
+
+def test_cli_subs_auto_logs_actual_language_and_source(tmp_path, capsys):
+    fetch = _fetch_module()
+    factory, _state = _fake_ydl(
+        {
+            "language": "en",
+            "subtitles": {"en-US": [{"ext": "vtt"}]},
+        }
+    )
+
+    exit_code = fetch.main(
+        [
+            "subs",
+            "https://example.test/video",
+            "--lang",
+            "auto",
+            "--out",
+            str(tmp_path / "out"),
+        ],
+        ydl_factory=factory,
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert "en-US" in captured.out
+    assert "官方字幕" in captured.out
 
 
 def test_cli_subs_escapes_selected_language_for_exact_yt_dlp_regex(
@@ -740,6 +923,39 @@ def test_cli_audio_produces_only_canonical_audio_file(tmp_path):
     ]
 
 
+def test_cli_audio_preflights_symlink_slot_before_network(tmp_path, capsys):
+    target = tmp_path / "outside-audio.m4a"
+    target.write_bytes(b"outside")
+    output_dir = tmp_path / "out"
+    output_dir.mkdir()
+    audio_slot = output_dir / "audio.m4a"
+    try:
+        audio_slot.symlink_to(target)
+    except (NotImplementedError, OSError):
+        pytest.skip("当前平台不允许创建测试 symlink")
+    fetch = _fetch_module()
+    factory, state = _fake_ydl({"title": "must not download"})
+
+    exit_code = fetch.main(
+        [
+            "audio",
+            "https://example.test/video",
+            "--out",
+            str(output_dir),
+        ],
+        ydl_factory=factory,
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert state["instances"] == 0
+    assert state["calls"] == []
+    assert audio_slot.is_symlink()
+    assert target.read_bytes() == b"outside"
+    assert "符号链接" in captured.err
+    assert "Traceback" not in captured.out + captured.err
+
+
 def test_cli_video_produces_canonical_video_and_metadata(tmp_path):
     fetch = _fetch_module()
     output_dir = tmp_path / "out"
@@ -781,6 +997,182 @@ def test_cli_video_produces_canonical_video_and_metadata(tmp_path):
         "video.mp4",
     }
     assert "height<=720" in state["options"][0]["format"]
+
+
+def test_cli_video_preflights_metadata_slot_before_network(
+    tmp_path, capsys
+):
+    fetch = _fetch_module()
+    output_dir = tmp_path / "out"
+    output_dir.mkdir()
+    old_video = output_dir / "video.mp4"
+    old_video.write_bytes(b"old-video")
+    metadata_slot = output_dir / "meta.json"
+    metadata_slot.mkdir()
+    factory, state = _fake_ydl({"title": "must not download"})
+
+    exit_code = fetch.main(
+        [
+            "video",
+            "https://example.test/video",
+            "--quality",
+            "720",
+            "--out",
+            str(output_dir),
+        ],
+        ydl_factory=factory,
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert state["instances"] == 0
+    assert state["calls"] == []
+    assert "meta.json" in captured.err
+    assert "目录" in captured.err
+    assert old_video.read_bytes() == b"old-video"
+    assert metadata_slot.is_dir()
+    assert "Traceback" not in captured.out + captured.err
+
+
+def test_cli_video_rolls_back_pair_when_second_publish_fails(
+    tmp_path, monkeypatch, capsys
+):
+    fetch = _fetch_module()
+    output_dir = tmp_path / "out"
+    output_dir.mkdir()
+    video_path = output_dir / "video.mp4"
+    metadata_path = output_dir / "meta.json"
+    video_path.write_bytes(b"old-video")
+    metadata_path.write_bytes(b"old-metadata")
+    factory, _state = _fake_ydl({"title": "new"})
+    real_replace = fetch._replace_file
+
+    def fail_second_publish(source, destination):
+        if (
+            source.parent.name == "new"
+            and source.name == "meta.json"
+            and destination == metadata_path
+        ):
+            raise OSError("secret simulated second publish failure")
+        return real_replace(source, destination)
+
+    monkeypatch.setattr(fetch, "_replace_file", fail_second_publish)
+
+    exit_code = fetch.main(
+        [
+            "video",
+            "https://example.test/video",
+            "--out",
+            str(output_dir),
+        ],
+        ydl_factory=factory,
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert video_path.read_bytes() == b"old-video"
+    assert metadata_path.read_bytes() == b"old-metadata"
+    assert list(output_dir.glob(".fetch-*")) == []
+    assert "旧文件已恢复" in captured.err
+    assert "secret" not in captured.out + captured.err
+    assert "Traceback" not in captured.out + captured.err
+
+
+def test_cli_video_atomically_replaces_existing_pair_and_cleans_backups(
+    tmp_path,
+):
+    fetch = _fetch_module()
+    output_dir = tmp_path / "out"
+    output_dir.mkdir()
+    (output_dir / "video.mp4").write_bytes(b"old-video")
+    (output_dir / "meta.json").write_bytes(b"old-metadata")
+    factory, _state = _fake_ydl(
+        {
+            "title": "new lesson",
+            "duration": 10,
+            "upload_date": "20260715",
+        }
+    )
+
+    exit_code = fetch.main(
+        [
+            "video",
+            "https://example.test/video",
+            "--quality",
+            "720",
+            "--out",
+            str(output_dir),
+        ],
+        ydl_factory=factory,
+    )
+
+    assert exit_code == 0
+    assert (output_dir / "video.mp4").read_bytes() == b"fake-mp4"
+    assert json.loads(
+        (output_dir / "meta.json").read_text(encoding="utf-8")
+    )["title"] == "new lesson"
+    assert {path.name for path in output_dir.iterdir()} == {
+        "video.mp4",
+        "meta.json",
+    }
+
+
+def test_cli_video_keeps_recovery_directory_when_rollback_fails(
+    tmp_path, monkeypatch, capsys
+):
+    fetch = _fetch_module()
+    output_dir = tmp_path / "out"
+    output_dir.mkdir()
+    video_path = output_dir / "video.mp4"
+    metadata_path = output_dir / "meta.json"
+    video_path.write_bytes(b"old-video")
+    metadata_path.write_bytes(b"old-metadata")
+    factory, _state = _fake_ydl({"title": "new"})
+    real_replace = fetch._replace_file
+
+    def fail_publish_and_video_restore(source, destination):
+        if (
+            source.parent.name == "new"
+            and source.name == "meta.json"
+            and destination == metadata_path
+        ):
+            raise OSError("secret publish failure")
+        if (
+            source.parent.name == "backups"
+            and source.name == "video.mp4"
+            and destination == video_path
+        ):
+            raise OSError("secret rollback failure")
+        return real_replace(source, destination)
+
+    monkeypatch.setattr(
+        fetch, "_replace_file", fail_publish_and_video_restore
+    )
+
+    exit_code = fetch.main(
+        [
+            "video",
+            "https://example.test/video",
+            "--out",
+            str(output_dir),
+        ],
+        ydl_factory=factory,
+    )
+
+    captured = capsys.readouterr()
+    recovery_dirs = list(output_dir.glob(".fetch-*"))
+    assert exit_code == 1
+    assert len(recovery_dirs) == 1
+    recovery_dir = recovery_dirs[0]
+    assert (recovery_dir / "backups" / "video.mp4").read_bytes() == (
+        b"old-video"
+    )
+    assert (recovery_dir / "RECOVERY.txt").is_file()
+    assert str(recovery_dir) in captured.err
+    assert "自动回滚也未完成" in captured.err
+    assert "RECOVERY.txt" in captured.err
+    assert "secret" not in captured.out + captured.err
+    assert "Traceback" not in captured.out + captured.err
 
 
 def test_cli_video_reports_when_no_compatible_mp4_format(

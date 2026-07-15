@@ -16,7 +16,7 @@
 - 首次使用先执行环境自检：
 
 ```bash
-python3 scripts/doctor.py
+python scripts/doctor.py
 ```
 
 - doctor exit 0：环境完整，可以继续下载。
@@ -25,24 +25,37 @@ python3 scripts/doctor.py
 - 下载必须保证 Python、yt-dlp 与输出目录可用；视频合并和音频提取还需
   ffmpeg。任何本次下载所需项失败，都应先按当前平台指引修复。
 - 与用户确认下载模式：完整视频，或仅音频。
-- 与用户确认素材目录，例如 `$HOME/ShushuStudy/2026-07-15-example`。
+- 准备真实素材标题；素材目录和视频清晰度必须来自
+  `common.py prepare` 返回的 JSON。
 - 不把受限、会员专享或地区不可用内容伪装成下载成功。
 
 ## 步骤
 
-1. 设置来源链接和本次素材目录；把示例值替换为真实值：
+1. 设置来源链接和真实标题，调用统一配置入口：
 
 ```bash
 URL='https://example.com/video'
-ITEM_DIR="$HOME/ShushuStudy/2026-07-15-example"
-python3 -c 'from pathlib import Path; import sys; Path(sys.argv[1]).mkdir(parents=True, exist_ok=True)' "$ITEM_DIR"
+TITLE='素材的真实标题'
+python scripts/common.py prepare --title "$TITLE"
 ```
 
-2. 下载完整视频时，按用户需要设置最高垂直分辨率：
+- exit 0：只解析 stdout 的 JSON，必须读取 `item_dir`、`output_dir`、
+  `native_lang`、`source_lang`、`whisper_model`、`video_quality` 和
+  `subtitle_layout` 全部七个字段。本手册把前者与 `video_quality`
+  分别记为 `ITEM_DIR` 与 `VIDEO_QUALITY`，其余配置原样保留给后续流水线。
+- exit 1：修复 `config.json` 或输出目录后重试；不手工拼接目录。
+- 默认使用当天；需要指定日期时加 `--date 2026-07-15`。
+- exit 2：修正标题或 `YYYY-MM-DD` 日期。
+- 下方变量表示 agent 已从 JSON 读取的真实值，不是手写默认值。
+
+2. 下载完整视频时，传入 JSON 中的最高垂直分辨率：
 
 ```bash
-python3 scripts/fetch.py video "$URL" --quality 1080 --out "$ITEM_DIR"
+python scripts/fetch.py video "$URL" --quality "$VIDEO_QUALITY" --out "$ITEM_DIR"
 ```
+
+只有用户明确要求本次临时覆盖清晰度时，才用用户值代替
+`VIDEO_QUALITY`；不回写 `config.json`。
 
 3. 完整视频命令的分支处理：
 
@@ -54,7 +67,7 @@ python3 scripts/fetch.py video "$URL" --quality 1080 --out "$ITEM_DIR"
 4. 用户只要音频时，运行：
 
 ```bash
-python3 scripts/fetch.py audio "$URL" --out "$ITEM_DIR"
+python scripts/fetch.py audio "$URL" --out "$ITEM_DIR"
 ```
 
 5. 仅音频命令的分支处理：
@@ -67,7 +80,7 @@ python3 scripts/fetch.py audio "$URL" --out "$ITEM_DIR"
 6. 完整视频成功后查看稳定元数据字段：
 
 ```bash
-python3 -m json.tool "$ITEM_DIR/meta.json"
+python -m json.tool "$ITEM_DIR/meta.json"
 ```
 
 - 只依赖 `url`、`title`、`uploader`、`duration_s`、`date` 五个字段。
@@ -77,7 +90,7 @@ python3 -m json.tool "$ITEM_DIR/meta.json"
 7. 最后列出本次目录，向用户回报实际文件而非预期文件：
 
 ```bash
-python3 -c 'from pathlib import Path; import sys; p=Path(sys.argv[1]); [print(f"{x.name}\t{x.stat().st_size} bytes") for x in sorted(p.iterdir()) if x.is_file()]' "$ITEM_DIR"
+python -c 'from pathlib import Path; import sys; p=Path(sys.argv[1]); [print(f"{x.name}\t{x.stat().st_size} bytes") for x in sorted(p.iterdir()) if x.is_file()]' "$ITEM_DIR"
 ```
 
 ## 产物路径
@@ -95,5 +108,5 @@ python3 -c 'from pathlib import Path; import sys; p=Path(sys.argv[1]); [print(f"
 - `地区限制`：说明当前网络无法访问，不承诺一定能下载。
 - `没有兼容 MP4 格式`：换公开且提供 MP4 兼容流的来源。
 - `无法写入输出目录`：检查路径、权限、磁盘空间和同名目录冲突。
-- `参数错误`：运行 `python3 scripts/fetch.py --help` 查看真实接口。
+- `参数错误`：运行 `python scripts/fetch.py --help` 查看真实接口。
 - 下载结果只用于用户授权的个人学习；转发或再发布前另行确认版权。
