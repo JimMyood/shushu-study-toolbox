@@ -1,0 +1,138 @@
+name: CI
+
+"on":
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  PYTHONUTF8: "1"
+
+jobs:
+  test:
+    name: ${{ matrix.os }} / Python ${{ matrix.python-version }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        python-version: ["3.11", "3.13"]
+
+    steps:
+      - name: 检出仓库
+        uses: actions/checkout@v6
+
+      - name: 安装 Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: 安装 Python 依赖
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+
+      - name: 安装系统 ffmpeg（Ubuntu）
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+
+      - name: 运行 doctor 并保存 JSON
+        id: doctor
+        continue-on-error: true
+        shell: python
+        run: |
+          from pathlib import Path
+          import subprocess
+          import sys
+
+          result = subprocess.run(
+              [sys.executable, "scripts/doctor.py", "--json"],
+              capture_output=True,
+              text=True,
+          )
+          Path("doctor.json").write_text(result.stdout, encoding="utf-8")
+          Path("doctor.exit-code").write_text(
+              str(result.returncode), encoding="utf-8"
+          )
+          sys.stderr.write(result.stderr)
+          raise SystemExit(result.returncode)
+
+      - name: 严格校验 doctor JSON
+        shell: python
+        run: |
+          import json
+          import os
+          from pathlib import Path
+
+          exit_code = int(
+              Path("doctor.exit-code").read_text(encoding="utf-8").strip()
+          )
+          assert exit_code in {0, 1}, f"doctor 异常退出：{exit_code}"
+
+          with Path("doctor.json").open(encoding="utf-8") as stream:
+              payload = json.load(stream)
+
+          expected_keys = {
+              "python",
+              "yt_dlp",
+              "ffmpeg",
+              "faster_whisper",
+              "output_dir_writable",
+          }
+          boolean_keys = {
+              "python",
+              "yt_dlp",
+              "faster_whisper",
+              "output_dir_writable",
+          }
+          assert isinstance(payload, dict), "doctor JSON 必须是对象"
+          assert set(payload) == expected_keys, "doctor JSON 键不符合契约"
+          assert all(
+              type(payload[key]) is bool for key in boolean_keys
+          ), "doctor JSON 布尔字段类型错误"
+          assert type(payload["ffmpeg"]) is str
+          assert payload["ffmpeg"] in {"system", "static", "missing"}
+          all_checks_pass = (
+              payload["python"]
+              and payload["yt_dlp"]
+              and payload["ffmpeg"] != "missing"
+              and payload["faster_whisper"]
+              and payload["output_dir_writable"]
+          )
+          expected_exit_code = 0 if all_checks_pass else 1
+          assert exit_code == expected_exit_code, (
+              "doctor 退出码与 JSON 结果不一致"
+          )
+          if os.environ["RUNNER_OS"] == "Linux":
+              assert payload["ffmpeg"] == "system", (
+                  "Ubuntu 必须覆盖系统 ffmpeg 路径"
+              )
+
+      - name: 验证 static-ffmpeg 兜底（macOS / Windows）
+        if: runner.os != 'Linux'
+        shell: python
+        run: |
+          import os
+          import sys
+          from pathlib import Path
+
+          sys.path.insert(0, str(Path.cwd() / "scripts"))
+          import doctor
+
+          doctor.shutil.which = lambda _name: None
+          ffmpeg_path, source = doctor.find_ffmpeg()
+          executable = Path(ffmpeg_path)
+
+          assert source == "static", "未走 static-ffmpeg 兜底路径"
+          assert executable.is_file(), f"静态 ffmpeg 不存在：{executable}"
+          assert os.access(executable, os.X_OK), (
+              f"静态 ffmpeg 不可执行：{executable}"
+          )
+
+      - name: 运行全量测试
+        run: pytest tests/ -v
