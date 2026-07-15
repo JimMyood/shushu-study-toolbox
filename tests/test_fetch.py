@@ -3,6 +3,7 @@ import json
 import math
 from pathlib import Path
 import re
+import socket
 import ssl
 import sys
 
@@ -277,9 +278,34 @@ def test_classify_requested_format_unavailable_explains_mp4_options():
     message = fetch.classify_error(RuntimeError(raw_message))
 
     assert "没有兼容 MP4" in message
-    assert "--quality" in message
+    assert "--quality" not in message
+    assert "换一个提供 MP4 兼容流的公开链接或来源" in message
     assert "请" in message
     assert raw_message not in message
+
+
+def test_is_network_error_recognizes_macos_socket_gaierror():
+    fetch = _fetch_module()
+    error = socket.gaierror(
+        socket.EAI_NONAME,
+        "nodename nor servname provided, or not known",
+    )
+
+    assert fetch._is_network_error(error) is True
+
+
+def test_classify_error_translates_macos_socket_gaierror():
+    fetch = _fetch_module()
+    error = socket.gaierror(
+        socket.EAI_NONAME,
+        "nodename nor servname provided, or not known",
+    )
+
+    message = fetch.classify_error(error)
+
+    assert "网络连接失败" in message
+    assert "请检查网络" in message
+    assert "nodename nor servname" not in message
 
 
 def test_select_subtitle_prefers_official_language_variant_over_auto_exact():
@@ -692,7 +718,8 @@ def test_cli_video_reports_when_no_compatible_mp4_format(
     captured = capsys.readouterr()
     assert exit_code == 1
     assert "没有兼容 MP4" in captured.err
-    assert "请降低 --quality" in captured.err
+    assert "--quality" not in captured.err
+    assert "请换一个提供 MP4 兼容流的公开链接或来源" in captured.err
     assert "确认链接有效" not in captured.err
     assert "Traceback" not in captured.out + captured.err
 
@@ -742,6 +769,34 @@ def test_cli_routes_network_oserror_to_network_help(
 ):
     fetch = _fetch_module()
     factory, _state = _fake_ydl({}, error=network_error)
+
+    exit_code = fetch.main(
+        [
+            "audio",
+            "https://example.test/video",
+            "--out",
+            str(tmp_path / "out"),
+        ],
+        ydl_factory=factory,
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert "网络连接失败" in captured.err
+    assert "请检查网络" in captured.err
+    assert "输出目录" not in captured.err
+    assert "Traceback" not in captured.out + captured.err
+
+
+def test_cli_routes_macos_socket_gaierror_to_network_help(
+    tmp_path, capsys
+):
+    fetch = _fetch_module()
+    error = socket.gaierror(
+        socket.EAI_NONAME,
+        "nodename nor servname provided, or not known",
+    )
+    factory, _state = _fake_ydl({}, error=error)
 
     exit_code = fetch.main(
         [

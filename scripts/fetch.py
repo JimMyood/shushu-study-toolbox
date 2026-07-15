@@ -6,6 +6,7 @@ import json
 import math
 from pathlib import Path
 import re
+import socket
 import ssl
 import sys
 import tempfile
@@ -24,6 +25,7 @@ _NETWORK_ERROR_MARKERS = (
     "network is unreachable",
     "temporary failure in name resolution",
     "name or service not known",
+    "nodename nor servname provided, or not known",
     "certificate_verify_failed",
     "certificate verify failed",
 )
@@ -110,8 +112,8 @@ def classify_error(error: Exception) -> str:
     message = str(error).lower()
     if "requested format is not available" in message:
         return (
-            "没有兼容 MP4 格式可供下载，所选清晰度可能只提供其他容器。"
-            "请降低 --quality 后重试，或换一个提供 MP4 的公开链接。"
+            "没有兼容 MP4 格式可供下载。"
+            "请换一个提供 MP4 兼容流的公开链接或来源。"
         )
     if any(
         marker in message
@@ -153,7 +155,8 @@ def classify_error(error: Exception) -> str:
 
 def _is_network_error(error: Exception) -> bool:
     return isinstance(
-        error, (TimeoutError, ConnectionError, ssl.SSLError)
+        error,
+        (TimeoutError, ConnectionError, socket.gaierror, ssl.SSLError),
     ) or any(
         marker in str(error).lower() for marker in _NETWORK_ERROR_MARKERS
     )
