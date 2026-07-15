@@ -5,6 +5,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import sys
+import tempfile
 from types import ModuleType, SimpleNamespace
 
 import pytest
@@ -164,6 +165,24 @@ def test_find_ffprobe_uses_sibling_of_static_ffmpeg(tmp_path, monkeypatch):
     assert transcribe._find_ffprobe() == str(fake_ffprobe)
 
 
+def test_find_ffprobe_uses_exe_sibling_for_windows_static_path(
+    tmp_path, monkeypatch
+):
+    transcribe = _load_transcribe()
+    fake_ffmpeg = tmp_path / "ffmpeg.exe"
+    fake_ffprobe = tmp_path / "ffprobe.exe"
+    fake_ffmpeg.write_bytes(b"ffmpeg")
+    fake_ffprobe.write_bytes(b"ffprobe")
+    monkeypatch.setattr(shutil, "which", lambda _name: None)
+    monkeypatch.setattr(
+        transcribe,
+        "find_ffmpeg",
+        lambda: (str(fake_ffmpeg), "static"),
+    )
+
+    assert transcribe._find_ffprobe() == str(fake_ffprobe)
+
+
 def test_probe_duration_calls_ffprobe_with_argument_list(
     tmp_path, monkeypatch
 ):
@@ -208,6 +227,9 @@ def test_probe_duration_calls_ffprobe_with_argument_list(
         ),
         subprocess.CompletedProcess(
             ["ffprobe"], returncode=0, stdout="not-a-number", stderr=""
+        ),
+        subprocess.CompletedProcess(
+            ["ffprobe"], returncode=0, stdout="0.0", stderr=""
         ),
     ],
 )
@@ -404,6 +426,105 @@ def test_ffprobe_error_exits_one_before_model(tmp_path, monkeypatch, capsys):
     assert not output_path.exists()
 
 
+def _assert_input_output_conflict(
+    transcribe,
+    input_path,
+    output_path,
+    monkeypatch,
+    capsys,
+):
+    original_content = b"original audio bytes"
+    input_path.write_bytes(original_content)
+    probe_calls = []
+    monkeypatch.setattr(
+        transcribe,
+        "probe_duration",
+        lambda path: probe_calls.append(path) or 12,
+    )
+    state = _install_fake_whisper(monkeypatch, [])
+
+    exit_code = transcribe.main(
+        [str(input_path), "--out", str(output_path)]
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert "不能覆盖源文件" in captured.err
+    assert "请为 --out 指定另一个" in captured.err
+    assert "Traceback" not in captured.out + captured.err
+    assert probe_calls == []
+    assert state["models"] == []
+    assert input_path.read_bytes() == original_content
+
+
+@pytest.mark.parametrize("path_form", ["lexical", "resolved"])
+def test_rejects_input_as_output_before_probe_or_model(
+    tmp_path, monkeypatch, capsys, path_form
+):
+    transcribe = _load_transcribe()
+    input_path = tmp_path / "input.m4a"
+    if path_form == "lexical":
+        output_path = input_path
+    else:
+        detour = tmp_path / "detour"
+        detour.mkdir()
+        output_path = detour / ".." / input_path.name
+
+    _assert_input_output_conflict(
+        transcribe,
+        input_path,
+        output_path,
+        monkeypatch,
+        capsys,
+    )
+
+
+def test_rejects_symlink_to_input_as_output_before_probe_or_model(
+    tmp_path, monkeypatch, capsys
+):
+    transcribe = _load_transcribe()
+    input_path = tmp_path / "input.m4a"
+    input_path.write_bytes(b"placeholder")
+    output_path = tmp_path / "output.srt"
+    try:
+        output_path.symlink_to(input_path)
+    except (OSError, NotImplementedError) as error:
+        pytest.skip(f"当前平台不能创建 symlink：{error}")
+
+    _assert_input_output_conflict(
+        transcribe,
+        input_path,
+        output_path,
+        monkeypatch,
+        capsys,
+    )
+
+    assert output_path.is_symlink()
+
+
+def test_rejects_hardlink_to_input_as_output_before_probe_or_model(
+    tmp_path, monkeypatch, capsys
+):
+    transcribe = _load_transcribe()
+    input_path = tmp_path / "input.m4a"
+    input_path.write_bytes(b"placeholder")
+    output_path = tmp_path / "output.srt"
+    try:
+        output_path.hardlink_to(input_path)
+    except (OSError, NotImplementedError) as error:
+        pytest.skip(f"当前平台不能创建 hardlink：{error}")
+
+    _assert_input_output_conflict(
+        transcribe,
+        input_path,
+        output_path,
+        monkeypatch,
+        capsys,
+    )
+
+    assert output_path.samefile(input_path)
+
+
 def _segments_that_fail():
     raise RuntimeError("secret iterator failure")
     yield
@@ -469,21 +590,106 @@ def test_output_directory_error_exits_one_without_starting_model(
     assert not output_path.exists()
 
 
-def test_srt_write_error_exits_one_without_internal_details(
-    tmp_path, monkeypatch, capsys
+def test_atomic_write_closes_same_directory_temp_before_replace(
+    tmp_path, monkeypatch
+):
+    transcribe = _load_transcribe()
+    output_path = tmp_path / "output.srt"
+    output_path.write_text("旧字幕", encoding="utf-8")
+    state = {}
+    real_named_temporary_file = tempfile.NamedTemporaryFile
+    real_replace = Path.replace
+
+    def recording_named_temporary_file(*args, **kwargs):
+        temporary = real_named_temporary_file(*args, **kwargs)
+        state["temporary"] = temporary
+        state["temporary_path"] = Path(temporary.name)
+        return temporary
+
+    def recording_replace(path, target):
+        assert state["temporary"].closed is True
+        assert path.parent == output_path.parent
+        state["replace_called"] = True
+        return real_replace(path, target)
+
+    monkeypatch.setattr(
+        tempfile,
+        "NamedTemporaryFile",
+        recording_named_temporary_file,
+    )
+    monkeypatch.setattr(Path, "replace", recording_replace)
+
+    transcribe._atomic_write_text(output_path, "新字幕：你好")
+
+    assert state["replace_called"] is True
+    assert output_path.read_text(encoding="utf-8") == "新字幕：你好"
+    assert set(tmp_path.iterdir()) == {output_path}
+
+
+class _FailingTemporaryFile:
+    def __init__(self, path: Path, failure_stage: str):
+        self.name = str(path)
+        self._path = path
+        self._failure_stage = failure_stage
+        self._file = None
+
+    def __enter__(self):
+        self._file = self._path.open(
+            "w",
+            encoding="utf-8",
+            newline="",
+        )
+        return self
+
+    def write(self, content: str):
+        written = self._file.write(content)
+        if self._failure_stage == "write":
+            raise OSError("secret write failure")
+        return written
+
+    def flush(self):
+        self._file.flush()
+        if self._failure_stage == "flush":
+            raise OSError("secret flush failure")
+
+    def __exit__(self, _type, _value, _traceback):
+        self._file.close()
+        return False
+
+
+@pytest.mark.parametrize("failure_stage", ["write", "flush", "replace"])
+def test_atomic_write_failure_preserves_old_target_and_removes_temp(
+    tmp_path, monkeypatch, capsys, failure_stage
 ):
     transcribe = _load_transcribe()
     audio_path, output_path = _success_paths(tmp_path)
+    output_path.parent.mkdir(parents=True)
+    output_path.write_text("不可丢失的旧字幕", encoding="utf-8")
     monkeypatch.setattr(transcribe, "probe_duration", lambda _path: 12)
-    _install_fake_whisper(monkeypatch, [])
-    original_write_text = Path.write_text
+    _install_fake_whisper(
+        monkeypatch,
+        [SimpleNamespace(start=0.0, end=1.0, text="新字幕")],
+    )
+    temporary_path = output_path.parent / ".forced-output.srt.tmp"
 
-    def fail_output_write(path, *args, **kwargs):
-        if path == output_path:
-            raise OSError("secret write failure")
-        return original_write_text(path, *args, **kwargs)
+    if failure_stage in {"write", "flush"}:
+        monkeypatch.setattr(
+            tempfile,
+            "NamedTemporaryFile",
+            lambda *args, **kwargs: _FailingTemporaryFile(
+                temporary_path,
+                failure_stage,
+            ),
+        )
+    else:
+        real_replace = Path.replace
 
-    monkeypatch.setattr(Path, "write_text", fail_output_write)
+        def fail_replace(path, target):
+            if Path(target) == output_path:
+                raise OSError("secret replace failure")
+            return real_replace(path, target)
+
+        monkeypatch.setattr(Path, "replace", fail_replace)
 
     exit_code = transcribe.main(
         [str(audio_path), "--out", str(output_path)]
@@ -495,4 +701,5 @@ def test_srt_write_error_exits_one_without_internal_details(
     assert "请检查" in captured.err
     assert "secret" not in captured.err
     assert "Traceback" not in captured.out + captured.err
-    assert not output_path.exists()
+    assert output_path.read_text(encoding="utf-8") == "不可丢失的旧字幕"
+    assert set(output_path.parent.iterdir()) == {output_path}

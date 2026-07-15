@@ -7,6 +7,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import sys
+import tempfile
 from typing import Sequence
 
 from doctor import _python_313_install_command, find_ffmpeg
@@ -89,13 +90,51 @@ def probe_duration(audio_path: Path) -> float:
         if result.returncode != 0:
             raise TranscribeError(message)
         duration = float(result.stdout.strip())
-        if not math.isfinite(duration) or duration < 0:
+        if not math.isfinite(duration) or duration <= 0:
             raise TranscribeError(message)
         return duration
     except TranscribeError:
         raise
     except (OSError, UnicodeError, ValueError, OverflowError) as error:
         raise TranscribeError(message) from error
+
+
+def _atomic_write_text(path: Path, content: str) -> None:
+    temporary_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            newline="",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as temporary:
+            temporary_path = Path(temporary.name)
+            temporary.write(content)
+            temporary.flush()
+        temporary_path.replace(path)
+    except BaseException:
+        if temporary_path is not None:
+            try:
+                temporary_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+        raise
+
+
+def _paths_refer_to_same_file(input_path: Path, output_path: Path) -> bool:
+    try:
+        if input_path.resolve() == output_path.resolve():
+            return True
+    except (OSError, RuntimeError, ValueError):
+        pass
+
+    try:
+        return input_path.samefile(output_path)
+    except (OSError, ValueError):
+        return False
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -135,6 +174,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(
             f"找不到输入音频：{args.audio}。"
             "请确认路径指向现有的音频或视频文件后重试。",
+            file=sys.stderr,
+        )
+        return 1
+
+    if _paths_refer_to_same_file(args.audio, args.out):
+        print(
+            "输出路径与输入音频是同一文件，不能覆盖源文件。"
+            "请为 --out 指定另一个 SRT 文件。",
             file=sys.stderr,
         )
         return 1
@@ -186,7 +233,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 1
 
     try:
-        args.out.write_text(rendered_srt, encoding="utf-8")
+        _atomic_write_text(args.out, rendered_srt)
     except (OSError, UnicodeError, ValueError):
         print(
             f"无法写入 SRT 字幕：{args.out}。"
