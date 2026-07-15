@@ -1,5 +1,6 @@
 from pathlib import Path
 import json, os, sys
+import re
 import subprocess
 import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
@@ -10,6 +11,40 @@ def test_sanitize_removes_windows_illegal_chars():
 
 def test_sanitize_truncates_to_80():
     assert len(common.sanitize_filename("x" * 200)) <= 80
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("CON", "_CON"),
+        ("con.txt", "_con.txt"),
+        ("PRN.notes.md", "_PRN.notes.md"),
+        ("aux", "_aux"),
+        ("NUL ", "_NUL"),
+        ("com1", "_com1"),
+        ("COM9.log", "_COM9.log"),
+        ("lpt1", "_lpt1"),
+        ("LPT9.anything", "_LPT9.anything"),
+        ("CON...", "_CON"),
+    ],
+)
+def test_sanitize_prefixes_windows_reserved_device_names(raw, expected):
+    assert common.sanitize_filename(raw) == expected
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "CON lesson",
+        "myCON.txt",
+        "CONNECTION.txt",
+        "COM10.log",
+        "LPT0.txt",
+        "auxiliary notes",
+    ],
+)
+def test_sanitize_does_not_change_non_reserved_names_containing_tokens(name):
+    assert common.sanitize_filename(name) == name
 
 
 @pytest.mark.parametrize(
@@ -525,3 +560,21 @@ def test_skill_and_manuals_use_active_python_and_version_aware_exit4():
     subtitle = contents["subtitle.md"]
     assert "与当前解释器匹配的恢复指引" in subtitle
     assert "Python 3.13 指引" not in subtitle
+
+
+def test_marketing_copy_does_not_hardcode_a_stale_test_count():
+    repo_root = Path(__file__).resolve().parent.parent
+    paths = [
+        repo_root / "marketing" / "xiaohongshu.md",
+        repo_root / "marketing" / "script-3min.md",
+    ]
+    contents = {path.name: path.read_text(encoding="utf-8") for path in paths}
+    combined = "\n".join(contents.values())
+
+    assert "166" not in combined
+    assert re.search(r"\b\d+\s*(?:项测试|tests?)\b", combined, re.I) is None
+    assert re.search(r"[零〇一二两三四五六七八九十百千万]+项测试", combined) is None
+    assert "全量回归测试" in contents["xiaohongshu.md"]
+    assert "全量回归测试" in contents["script-3min.md"]
+    assert "发布前" in contents["xiaohongshu.md"]
+    assert "发布前" in contents["script-3min.md"]

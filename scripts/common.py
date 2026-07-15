@@ -22,6 +22,11 @@ DEFAULTS = {
 }
 
 _WINDOWS_ILLEGAL_CHARS = frozenset('<>:"/\\|?*')
+_WINDOWS_RESERVED_NAMES = frozenset(
+    {"CON", "PRN", "AUX", "NUL"}
+    | {f"COM{number}" for number in range(1, 10)}
+    | {f"LPT{number}" for number in range(1, 10)}
+)
 
 
 def load_config() -> dict:
@@ -68,7 +73,11 @@ def sanitize_filename(name: str) -> str:
     )
     # Windows 会忽略文件名尾部的点和空格，不先清理会导致
     # 路径判断与真实目录名不一致。截断后再清一次避免第 80 位是点。
-    return " ".join(cleaned.split()).rstrip(" .")[:80].rstrip(" .")
+    cleaned = " ".join(cleaned.split()).rstrip(" .")[:80].rstrip(" .")
+    device_name = cleaned.partition(".")[0].upper()
+    if device_name in _WINDOWS_RESERVED_NAMES:
+        return f"_{cleaned}"
+    return cleaned
 
 
 def item_dir(config: dict, title: str, date_str: str) -> Path:
