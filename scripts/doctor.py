@@ -53,7 +53,7 @@ def _check_output_dir(output_dir: Path) -> bool:
         ) as probe:
             probe.write("ok")
             probe.flush()
-    except OSError:
+    except (OSError, ValueError):
         return False
     return True
 
@@ -106,6 +106,14 @@ def _all_checks_pass(checks: dict) -> bool:
         and checks["faster_whisper"]
         and checks["output_dir_writable"]
     )
+
+
+def _load_config_for_checks() -> dict:
+    try:
+        return load_config()
+    except SystemExit as error:
+        print(str(error), file=sys.stderr)
+        return {"output_dir": None}
 
 
 def _print_human_report(
@@ -173,11 +181,11 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.json:
         with redirect_stdout(sys.stderr):
-            config = load_config()
+            config = _load_config_for_checks()
             checks, ffmpeg_path, output_dir = _collect_checks(config)
         print(json.dumps(checks, ensure_ascii=False))
     else:
-        config = load_config()
+        config = _load_config_for_checks()
         checks, ffmpeg_path, output_dir = _collect_checks(config)
         _print_human_report(checks, ffmpeg_path, output_dir)
 
