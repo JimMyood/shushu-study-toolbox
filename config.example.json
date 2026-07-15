@@ -1,0 +1,14 @@
+{
+  "_comment_output_dir": "学习素材的集中输出目录，支持使用 ~ 表示用户主目录",
+  "output_dir": "~/ShushuStudy",
+  "_comment_native_lang": "母语代码，译文和笔记使用该语言",
+  "native_lang": "zh",
+  "_comment_source_lang": "源语言代码；auto 表示自动识别",
+  "source_lang": "auto",
+  "_comment_whisper_model": "本地转写模型，可选 tiny、small 或 medium",
+  "whisper_model": "small",
+  "_comment_video_quality": "下载视频的最高垂直分辨率",
+  "video_quality": "1080",
+  "_comment_subtitle_layout": "双语字幕上下顺序；original-top 表示原文在上",
+  "subtitle_layout": "original-top"
+}
