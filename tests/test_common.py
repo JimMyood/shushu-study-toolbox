@@ -1,5 +1,6 @@
 from pathlib import Path
 import json, sys
+import subprocess
 import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 import common
@@ -29,7 +30,7 @@ def test_load_config_explains_invalid_config(
     config_path.write_text(contents, encoding="utf-8")
     monkeypatch.setattr(common, "REPO_ROOT", tmp_path)
 
-    with pytest.raises(ValueError) as error:
+    with pytest.raises(SystemExit) as error:
         common.load_config()
 
     message = str(error.value)
@@ -37,6 +38,41 @@ def test_load_config_explains_invalid_config(
     assert problem in message
     assert "请修正该文件" in message
     assert "复制 config.example.json 为 config.json" in message
+
+def test_load_config_process_error_has_no_traceback(tmp_path):
+    config_path = tmp_path / "config.json"
+    config_path.write_text("{", encoding="utf-8")
+    scripts_dir = Path(common.__file__).resolve().parent
+    command = (
+        "from pathlib import Path\n"
+        "import sys\n"
+        "sys.path.insert(0, sys.argv[1])\n"
+        "import common\n"
+        "common.REPO_ROOT = Path(sys.argv[2])\n"
+        "common.load_config()\n"
+    )
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-X",
+            "utf8",
+            "-c",
+            command,
+            str(scripts_dir),
+            str(tmp_path),
+        ],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert str(config_path) in result.stderr
+    assert "请修正该文件" in result.stderr
+    assert "复制 config.example.json 为 config.json" in result.stderr
+    assert "Traceback" not in result.stderr
 
 def test_item_dir_expands_home_and_creates(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(tmp_path))
