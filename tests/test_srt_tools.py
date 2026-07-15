@@ -69,6 +69,27 @@ def _write_manifest(chunks_dir: Path, manifest: object) -> None:
     )
 
 
+def _convert_to_legacy_manifest(
+    chunks_dir: Path, input_path: Path = SAMPLE
+) -> dict:
+    manifest = _read_manifest(chunks_dir)
+    manifest.pop("schema_version")
+    manifest.pop("input_sha256")
+    manifest["input_file"] = str(input_path)
+    for chunk in manifest["chunks"]:
+        chunk.pop("source_sha256")
+        translated_path = chunks_dir / chunk["translation_file"]
+        legacy_path = translated_path.with_name(
+            translated_path.name.replace(".translated.txt", ".zh.txt")
+        )
+        if translated_path.exists() or translated_path.is_symlink():
+            translated_path.rename(legacy_path)
+        chunk["translation_file"] = legacy_path.name
+        chunk.pop("needs_translation", None)
+    _write_manifest(chunks_dir, manifest)
+    return manifest
+
+
 def _assert_manifest_damaged(
     result: subprocess.CompletedProcess[str], output_path: Path
 ) -> None:
@@ -563,27 +584,13 @@ def test_merge_rejects_tampered_source_chunk(tmp_path):
     _assert_manifest_damaged(result, output_path)
 
 
-def test_merge_reads_legacy_manifest_and_zh_translations_without_writing_them(
-    tmp_path,
-):
+def test_merge_rejects_legacy_manifest_even_when_source_chunks_match(tmp_path):
     chunks_dir = _chunk_sample(tmp_path)
     _write_translations(chunks_dir)
-    manifest = _read_manifest(chunks_dir)
-    manifest.pop("schema_version")
-    manifest.pop("input_sha256")
-    manifest["input_file"] = str(SAMPLE)
+    _convert_to_legacy_manifest(chunks_dir)
     legacy_contents = {}
-    for chunk in manifest["chunks"]:
-        chunk.pop("source_sha256")
-        translated_path = chunks_dir / chunk["translation_file"]
-        legacy_path = translated_path.with_name(
-            translated_path.name.replace(".translated.txt", ".zh.txt")
-        )
-        translated_path.rename(legacy_path)
-        chunk["translation_file"] = legacy_path.name
-        chunk.pop("needs_translation", None)
+    for legacy_path in chunks_dir.glob("chunk_*.zh.txt"):
         legacy_contents[legacy_path] = legacy_path.read_text(encoding="utf-8")
-    _write_manifest(chunks_dir, manifest)
     output_path = tmp_path / "bilingual.srt"
 
     result = _run_cli(
@@ -597,14 +604,19 @@ def test_merge_reads_legacy_manifest_and_zh_translations_without_writing_them(
         output_path,
     )
 
-    assert result.returncode == 0, result.stderr
-    assert output_path.is_file()
+    assert result.returncode == 2
+    assert "旧版 manifest 缺少源字幕 hash" in result.stderr
+    assert "重新运行 chunk 并重翻" in result.stderr
+    assert "Traceback" not in result.stderr
+    assert not output_path.exists()
     assert {
         path: path.read_text(encoding="utf-8") for path in legacy_contents
     } == legacy_contents
 
 
-def test_merge_legacy_manifest_still_rejects_changed_source_content(tmp_path):
+def test_merge_rejects_real_legacy_stale_translation_after_old_tool_refreshed_source_chunks(
+    tmp_path,
+):
     input_path = tmp_path / "source.srt"
     input_path.write_text(SAMPLE.read_text(encoding="utf-8"), encoding="utf-8")
     chunks_dir = tmp_path / "chunks"
@@ -613,19 +625,10 @@ def test_merge_legacy_manifest_still_rejects_changed_source_content(tmp_path):
     )
     assert chunk_result.returncode == 0, chunk_result.stderr
     _write_translations(chunks_dir)
-    manifest = _read_manifest(chunks_dir)
-    manifest.pop("schema_version")
-    manifest.pop("input_sha256")
-    for chunk in manifest["chunks"]:
-        chunk.pop("source_sha256")
-        translated_path = chunks_dir / chunk["translation_file"]
-        legacy_path = translated_path.with_name(
-            translated_path.name.replace(".translated.txt", ".zh.txt")
-        )
-        translated_path.rename(legacy_path)
-        chunk["translation_file"] = legacy_path.name
-        chunk.pop("needs_translation", None)
-    _write_manifest(chunks_dir, manifest)
+    _convert_to_legacy_manifest(chunks_dir, input_path)
+    stale_translation = (chunks_dir / "chunk_000.zh.txt").read_text(
+        encoding="utf-8"
+    )
 
     subtitles = _read_subtitles(input_path)
     subtitles[0] = srt.Subtitle(
@@ -637,6 +640,13 @@ def test_merge_legacy_manifest_still_rejects_changed_source_content(tmp_path):
     )
     input_path.write_text(
         srt.compose(subtitles, reindex=False), encoding="utf-8"
+    )
+    refreshed_chunk = (
+        "\n".join(" ".join(cue.content.splitlines()) for cue in subtitles[:2])
+        + "\n"
+    )
+    (chunks_dir / "chunk_000.txt").write_text(
+        refreshed_chunk, encoding="utf-8"
     )
     output_path = tmp_path / "bilingual.srt"
 
@@ -651,7 +661,119 @@ def test_merge_legacy_manifest_still_rejects_changed_source_content(tmp_path):
         output_path,
     )
 
-    _assert_manifest_damaged(result, output_path)
+    assert result.returncode == 2
+    assert "旧版 manifest 缺少源字幕 hash" in result.stderr
+    assert "重新运行 chunk 并重翻" in result.stderr
+    assert not output_path.exists()
+    assert (chunks_dir / "chunk_000.zh.txt").read_text(
+        encoding="utf-8"
+    ) == stale_translation
+
+
+def test_chunk_legacy_resume_isolates_every_zh_and_marks_all_for_retranslation(
+    tmp_path,
+):
+    chunks_dir = _chunk_sample(tmp_path)
+    _write_translations(chunks_dir)
+    _convert_to_legacy_manifest(chunks_dir)
+    legacy_contents = {
+        path.name: path.read_text(encoding="utf-8")
+        for path in chunks_dir.glob("chunk_*.zh.txt")
+    }
+    existing_stale = chunks_dir / "chunk_000.stale-legacy.txt"
+    existing_stale.write_text("更早的旧译文\n", encoding="utf-8")
+
+    result = _run_cli("chunk", SAMPLE, "--size", 2, "--out-dir", chunks_dir)
+
+    assert result.returncode == 0, result.stderr
+    assert "旧版译文无法验证" in result.stderr
+    manifest = _read_manifest(chunks_dir)
+    assert manifest["schema_version"] == 2
+    assert [chunk["needs_translation"] for chunk in manifest["chunks"]] == [
+        True,
+        True,
+        True,
+    ]
+    assert not list(chunks_dir.glob("chunk_*.zh.txt"))
+    assert not list(chunks_dir.glob("chunk_*.translated.txt"))
+    assert existing_stale.read_text(encoding="utf-8") == "更早的旧译文\n"
+    assert (chunks_dir / "chunk_000.stale-legacy-2.txt").read_text(
+        encoding="utf-8"
+    ) == legacy_contents["chunk_000.zh.txt"]
+    assert (chunks_dir / "chunk_001.stale-legacy.txt").read_text(
+        encoding="utf-8"
+    ) == legacy_contents["chunk_001.zh.txt"]
+    assert (chunks_dir / "chunk_002.stale-legacy.txt").read_text(
+        encoding="utf-8"
+    ) == legacy_contents["chunk_002.zh.txt"]
+
+
+@pytest.mark.parametrize("legacy_kind", ["symlink", "directory"])
+def test_chunk_legacy_resume_isolates_path_entry_without_following_it(
+    tmp_path, legacy_kind
+):
+    chunks_dir = _chunk_sample(tmp_path)
+    _convert_to_legacy_manifest(chunks_dir)
+    legacy_path = chunks_dir / "chunk_000.zh.txt"
+    external = tmp_path / "external.txt"
+    external.write_text("外部内容不可改变\n", encoding="utf-8")
+    if legacy_kind == "symlink":
+        try:
+            legacy_path.symlink_to(external)
+        except OSError as error:
+            pytest.skip(f"当前平台不能创建 symlink：{error}")
+    else:
+        legacy_path.mkdir()
+        (legacy_path / "marker.txt").write_text("目录内容", encoding="utf-8")
+
+    result = _run_cli("chunk", SAMPLE, "--size", 2, "--out-dir", chunks_dir)
+
+    assert result.returncode == 0, result.stderr
+    assert "旧版译文无法验证" in result.stderr
+    assert not legacy_path.exists() and not legacy_path.is_symlink()
+    stale_paths = list(chunks_dir.glob("chunk_000.stale-legacy*.txt"))
+    assert len(stale_paths) == 1
+    stale_path = stale_paths[0]
+    if legacy_kind == "symlink":
+        assert stale_path.is_symlink()
+        assert stale_path.resolve() == external.resolve()
+        assert external.read_text(encoding="utf-8") == "外部内容不可改变\n"
+    else:
+        assert stale_path.is_dir()
+        assert (stale_path / "marker.txt").read_text(encoding="utf-8") == (
+            "目录内容"
+        )
+    manifest = _read_manifest(chunks_dir)
+    assert manifest["chunks"][0]["needs_translation"] is True
+    assert not (chunks_dir / "chunk_000.translated.txt").exists()
+
+
+def test_chunk_legacy_isolation_failure_preserves_old_translation(
+    tmp_path, monkeypatch, capsys
+):
+    srt_tools = _load_srt_tools()
+    chunks_dir = _chunk_sample(tmp_path)
+    _write_translations(chunks_dir)
+    _convert_to_legacy_manifest(chunks_dir)
+    legacy_path = chunks_dir / "chunk_000.zh.txt"
+    old_content = legacy_path.read_text(encoding="utf-8")
+    real_replace = Path.replace
+
+    def fail_legacy_isolation(path, target):
+        if path == legacy_path and "stale-legacy" in Path(target).name:
+            raise OSError("secret isolation failure")
+        return real_replace(path, target)
+
+    monkeypatch.setattr(Path, "replace", fail_legacy_isolation)
+
+    exit_code = srt_tools.chunk_subtitles(SAMPLE, 2, chunks_dir)
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert "无法隔离旧版译文" in captured.err
+    assert "secret" not in captured.err
+    assert legacy_path.read_text(encoding="utf-8") == old_content
+    assert not (chunks_dir / "chunk_000.translated.txt").exists()
 
 
 def test_merge_rejects_source_with_different_cue_count(tmp_path):

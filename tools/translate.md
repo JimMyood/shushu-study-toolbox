@@ -51,6 +51,9 @@ python scripts/srt_tools.py chunk "$SOURCE_SRT" --size 40 --out-dir "$CHUNKS_DIR
   manifest 配新源文。
 - 重跑 chunk 会刷新源文本和 manifest。源文未变时保留已有译文；某一块源文变化
   时，只把该块旧译文改名保留为 `chunk_NNN.stale-<hash>.txt`，等待重翻。
+- 上一版 manifest 没有 hash，无法证明 `.zh.txt` 与哪版源文绑定；重跑时会把所有
+  旧译文条目原子隔离为 `chunk_NNN.stale-legacy[-N].txt`，全部标记待重翻。即使
+  源文看似未变也不得自动复用。
 
 4. 对每个 `chunk_NNN.txt` 生成同名 `chunk_NNN.translated.txt`。
 
@@ -73,7 +76,7 @@ python -c 'from pathlib import Path; import sys; a=Path(sys.argv[1]).read_text(e
 
 - 以 manifest 的 `needs_translation` 和实际文件为准，只翻译缺少对应
   `chunk_NNN.translated.txt` 的源块。
-- 源 hash 未变且已有译文时，工具会安全续跑，不重翻、不覆盖。
+- 新版 manifest 中源 hash 未变且已有译文时，工具会安全续跑，不重翻、不覆盖。
 - 若源 SRT 改变，工具只隔离受影响块的旧译文；`stale-<hash>.txt` 仅供人工参考，
   不得改回正式文件名冒充新译文。
 - 翻完被隔离的块后写入新的 `.translated.txt`；可再跑一次 chunk，让 manifest
@@ -118,8 +121,10 @@ python scripts/srt_tools.py validate "$ITEM_DIR/subs.bi.srt"
 - `缺少第 N 块译文`：只补对应 `.translated.txt`，不要整批重翻。
 - 出现 `stale-<hash>.txt`：源文已改变；旧译文已保留但不会参与合并，重翻正式
   `.translated.txt` 后继续。
-- 旧版 `manifest.json` 与 `.zh.txt`：源分块仍与当前 SRT 完全一致时可只读合并；
-  再运行 chunk 会生成新版清单，并把可安全复用的旧译文复制为中性文件名。
+- 旧版 `manifest.json` 与 `.zh.txt`：禁止直接合并，因为没有 hash 就无法证明译文
+  对应当前源文。重新运行 chunk；工具会把每个旧 `.zh.txt` 路径条目（包括符号链接
+  或目录）整体改名隔离，不读取链接目标或目录内容。随后重翻全部正式
+  `.translated.txt`。
 - `行数不符`：一条原文对应一行译文，删除多余换行或补回缺行。
 - `译文为空`：补译该行；空白占位不算有效翻译。
 - 时间轴警告：翻译不应改时间码；检查是否使用了正确的原文 SRT。

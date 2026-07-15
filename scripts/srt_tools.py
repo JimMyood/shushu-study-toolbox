@@ -11,6 +11,10 @@ from typing import Sequence
 import srt
 
 
+class LegacyIsolationError(Exception):
+    """旧版译文条目无法安全隔离。"""
+
+
 def _read_subtitles(path: Path) -> list[srt.Subtitle]:
     return list(srt.parse(path.read_text(encoding="utf-8")))
 
@@ -111,24 +115,21 @@ def _manifest_is_valid(
     if not isinstance(manifest, dict):
         return False
 
-    schema_version = manifest.get("schema_version")
-    is_legacy = schema_version is None
-    if not is_legacy and schema_version != 2:
+    if manifest.get("schema_version") != 2:
         return False
 
-    if not is_legacy:
-        input_file = manifest.get("input_file")
-        if (
-            not isinstance(input_file, str)
-            or not input_file
-            or Path(input_file).name != input_file
-            or "/" in input_file
-            or "\\" in input_file
-        ):
-            return False
-        input_hash = manifest.get("input_sha256")
-        if not _is_sha256(input_hash) or input_hash != _input_sha256(subtitles):
-            return False
+    input_file = manifest.get("input_file")
+    if (
+        not isinstance(input_file, str)
+        or not input_file
+        or Path(input_file).name != input_file
+        or "/" in input_file
+        or "\\" in input_file
+    ):
+        return False
+    input_hash = manifest.get("input_sha256")
+    if not _is_sha256(input_hash) or input_hash != _input_sha256(subtitles):
+        return False
 
     cue_count = manifest.get("cue_count")
     chunk_size = manifest.get("chunk_size")
@@ -148,12 +149,12 @@ def _manifest_is_valid(
         "number",
         "source_file",
         "translation_file",
+        "needs_translation",
+        "source_sha256",
         "line_count",
         "cue_index_start",
         "cue_index_end",
     }
-    if not is_legacy:
-        required_fields.update({"needs_translation", "source_sha256"})
     cursor = 0
     for number, chunk in enumerate(chunks):
         if not isinstance(chunk, dict):
@@ -166,11 +167,7 @@ def _manifest_is_valid(
         expected_start_index = subtitles[cursor].index
         expected_end_index = subtitles[end_cursor].index
         expected_source_file = f"chunk_{number:03d}.txt"
-        expected_translation_file = (
-            f"chunk_{number:03d}.zh.txt"
-            if is_legacy
-            else f"chunk_{number:03d}.translated.txt"
-        )
+        expected_translation_file = f"chunk_{number:03d}.translated.txt"
         expected_source_text = _chunk_text(subtitles[cursor : end_cursor + 1])
 
         if type(chunk["number"]) is not int or chunk["number"] != number:
@@ -184,15 +181,14 @@ def _manifest_is_valid(
             return False
         if chunk["translation_file"] != expected_translation_file:
             return False
-        if not is_legacy:
-            if type(chunk["needs_translation"]) is not bool:
-                return False
-            source_hash = chunk["source_sha256"]
-            if (
-                not _is_sha256(source_hash)
-                or source_hash != _sha256_text(expected_source_text)
-            ):
-                return False
+        if type(chunk["needs_translation"]) is not bool:
+            return False
+        source_hash = chunk["source_sha256"]
+        if (
+            not _is_sha256(source_hash)
+            or source_hash != _sha256_text(expected_source_text)
+        ):
+            return False
         if (
             type(chunk["cue_index_start"]) is not type(expected_start_index)
             or chunk["cue_index_start"] != expected_start_index
@@ -224,7 +220,7 @@ def _previous_chunk_binding(
     chunks_dir: Path,
 ) -> tuple[str | None, Path | None]:
     """返回旧分块绑定的源 hash 与译文路径；格式异常时不信任。"""
-    if not isinstance(manifest, dict):
+    if not isinstance(manifest, dict) or manifest.get("schema_version") != 2:
         return None, None
     chunks = manifest.get("chunks")
     if not isinstance(chunks, list) or number >= len(chunks):
@@ -245,24 +241,15 @@ def _previous_chunk_binding(
         return None, None
     actual_source_hash = _sha256_text(source_text)
 
-    if manifest.get("schema_version") == 2:
-        recorded_hash = chunk.get("source_sha256")
-        expected_translation = f"chunk_{number:03d}.translated.txt"
-        if (
-            not _is_sha256(recorded_hash)
-            or recorded_hash != actual_source_hash
-            or chunk.get("translation_file") != expected_translation
-        ):
-            return None, None
-        return recorded_hash, chunks_dir / expected_translation
-
-    if manifest.get("schema_version") is None:
-        expected_translation = f"chunk_{number:03d}.zh.txt"
-        if chunk.get("translation_file") != expected_translation:
-            return None, None
-        return actual_source_hash, chunks_dir / expected_translation
-
-    return None, None
+    recorded_hash = chunk.get("source_sha256")
+    expected_translation = f"chunk_{number:03d}.translated.txt"
+    if (
+        not _is_sha256(recorded_hash)
+        or recorded_hash != actual_source_hash
+        or chunk.get("translation_file") != expected_translation
+    ):
+        return None, None
+    return recorded_hash, chunks_dir / expected_translation
 
 
 def _next_stale_path(
@@ -279,6 +266,54 @@ def _next_stale_path(
     return candidate
 
 
+def _is_legacy_translation_name(name: str) -> bool:
+    prefix = "chunk_"
+    suffix = ".zh.txt"
+    return (
+        name.startswith(prefix)
+        and name.endswith(suffix)
+        and name[len(prefix) : -len(suffix)].isdigit()
+    )
+
+
+def _next_legacy_stale_path(legacy_path: Path) -> Path:
+    chunk_name = legacy_path.name[: -len(".zh.txt")]
+    candidate = legacy_path.with_name(f"{chunk_name}.stale-legacy.txt")
+    counter = 2
+    while candidate.exists() or candidate.is_symlink():
+        candidate = legacy_path.with_name(
+            f"{chunk_name}.stale-legacy-{counter}.txt"
+        )
+        counter += 1
+    return candidate
+
+
+def _isolate_legacy_translations(out_dir: Path) -> None:
+    try:
+        legacy_paths = sorted(
+            (
+                path
+                for path in out_dir.iterdir()
+                if _is_legacy_translation_name(path.name)
+            ),
+            key=lambda path: path.name,
+        )
+    except OSError as error:
+        raise LegacyIsolationError from error
+
+    for legacy_path in legacy_paths:
+        stale_path = _next_legacy_stale_path(legacy_path)
+        try:
+            legacy_path.replace(stale_path)
+        except OSError as error:
+            raise LegacyIsolationError from error
+        print(
+            f"旧版译文无法验证，已隔离为 {stale_path.name}；"
+            "请按当前源文重翻该块",
+            file=sys.stderr,
+        )
+
+
 def chunk_subtitles(input_path: Path, size: int, out_dir: Path) -> int:
     try:
         subtitles = _read_subtitles(input_path)
@@ -288,6 +323,19 @@ def chunk_subtitles(input_path: Path, size: int, out_dir: Path) -> int:
     try:
         out_dir.mkdir(parents=True, exist_ok=True)
         previous_manifest = _load_manifest(out_dir / "manifest.json")
+        if (
+            isinstance(previous_manifest, dict)
+            and previous_manifest.get("schema_version") is None
+        ):
+            try:
+                _isolate_legacy_translations(out_dir)
+            except LegacyIsolationError:
+                print(
+                    f"无法隔离旧版译文：{out_dir}。"
+                    "请检查目录权限后重试；原译文不会被自动复用",
+                    file=sys.stderr,
+                )
+                return 1
         chunks = []
 
         for number, offset in enumerate(range(0, len(subtitles), size)):
@@ -319,20 +367,6 @@ def chunk_subtitles(input_path: Path, size: int, out_dir: Path) -> int:
                     f"{stale_path.name}",
                     file=sys.stderr,
                 )
-
-            if (
-                not safely_reusable
-                and old_translation_path is not None
-                and old_translation_path != translation_path
-                and old_hash == source_hash
-                and old_translation_path.is_file()
-                and not old_translation_path.is_symlink()
-            ):
-                legacy_translation = old_translation_path.read_text(
-                    encoding="utf-8"
-                )
-                _atomic_write_text(translation_path, legacy_translation)
-                safely_reusable = True
 
             _atomic_write_text(out_dir / source_file, source_text)
             chunks.append(
@@ -388,6 +422,13 @@ def merge_subtitles(
         print("缺少 manifest.json，请先运行 chunk", file=sys.stderr)
         return 2
     manifest = _load_manifest(manifest_path)
+    if isinstance(manifest, dict) and manifest.get("schema_version") is None:
+        print(
+            "旧版 manifest 缺少源字幕 hash，无法证明译文对应当前源文；"
+            "请重新运行 chunk 并重翻旧版译文",
+            file=sys.stderr,
+        )
+        return 2
     if not _manifest_is_valid(manifest, subtitles, chunks_dir):
         print("manifest 损坏，请重新运行 chunk", file=sys.stderr)
         return 2
