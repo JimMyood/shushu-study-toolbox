@@ -1,9 +1,11 @@
 """SRT 字幕分块、双语合并与时间轴校验工具。"""
 
 import argparse
+import hashlib
 import json
 from pathlib import Path
 import sys
+import tempfile
 from typing import Sequence
 
 import srt
@@ -15,6 +17,65 @@ def _read_subtitles(path: Path) -> list[srt.Subtitle]:
 
 def _one_line(content: str) -> str:
     return " ".join(content.splitlines())
+
+
+def _sha256_text(content: str) -> str:
+    return hashlib.sha256(content.encode("utf-8")).hexdigest()
+
+
+def _input_sha256(subtitles: list[srt.Subtitle]) -> str:
+    return _sha256_text(srt.compose(subtitles, reindex=False))
+
+
+def _chunk_text(subtitles: list[srt.Subtitle]) -> str:
+    if not subtitles:
+        return ""
+    return "\n".join(_one_line(cue.content) for cue in subtitles) + "\n"
+
+
+def _is_sha256(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
+def _atomic_write_text(path: Path, content: str) -> None:
+    temporary_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            newline="",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as temporary:
+            temporary_path = Path(temporary.name)
+            temporary.write(content)
+            temporary.flush()
+        temporary_path.replace(path)
+    except BaseException:
+        if temporary_path is not None:
+            try:
+                temporary_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+        raise
+
+
+def _paths_refer_to_same_file(first: Path, second: Path) -> bool:
+    try:
+        if first.resolve() == second.resolve():
+            return True
+    except (OSError, RuntimeError, ValueError):
+        pass
+    try:
+        return first.samefile(second)
+    except (OSError, ValueError):
+        return False
 
 
 def _positive_int(value: str) -> int:
@@ -43,10 +104,31 @@ def _load_manifest(path: Path) -> object | None:
 
 
 def _manifest_is_valid(
-    manifest: object, subtitles: list[srt.Subtitle]
+    manifest: object,
+    subtitles: list[srt.Subtitle],
+    chunks_dir: Path,
 ) -> bool:
     if not isinstance(manifest, dict):
         return False
+
+    schema_version = manifest.get("schema_version")
+    is_legacy = schema_version is None
+    if not is_legacy and schema_version != 2:
+        return False
+
+    if not is_legacy:
+        input_file = manifest.get("input_file")
+        if (
+            not isinstance(input_file, str)
+            or not input_file
+            or Path(input_file).name != input_file
+            or "/" in input_file
+            or "\\" in input_file
+        ):
+            return False
+        input_hash = manifest.get("input_sha256")
+        if not _is_sha256(input_hash) or input_hash != _input_sha256(subtitles):
+            return False
 
     cue_count = manifest.get("cue_count")
     chunk_size = manifest.get("chunk_size")
@@ -70,6 +152,8 @@ def _manifest_is_valid(
         "cue_index_start",
         "cue_index_end",
     }
+    if not is_legacy:
+        required_fields.update({"needs_translation", "source_sha256"})
     cursor = 0
     for number, chunk in enumerate(chunks):
         if not isinstance(chunk, dict):
@@ -82,7 +166,12 @@ def _manifest_is_valid(
         expected_start_index = subtitles[cursor].index
         expected_end_index = subtitles[end_cursor].index
         expected_source_file = f"chunk_{number:03d}.txt"
-        expected_translation_file = f"chunk_{number:03d}.zh.txt"
+        expected_translation_file = (
+            f"chunk_{number:03d}.zh.txt"
+            if is_legacy
+            else f"chunk_{number:03d}.translated.txt"
+        )
+        expected_source_text = _chunk_text(subtitles[cursor : end_cursor + 1])
 
         if type(chunk["number"]) is not int or chunk["number"] != number:
             return False
@@ -95,6 +184,15 @@ def _manifest_is_valid(
             return False
         if chunk["translation_file"] != expected_translation_file:
             return False
+        if not is_legacy:
+            if type(chunk["needs_translation"]) is not bool:
+                return False
+            source_hash = chunk["source_sha256"]
+            if (
+                not _is_sha256(source_hash)
+                or source_hash != _sha256_text(expected_source_text)
+            ):
+                return False
         if (
             type(chunk["cue_index_start"]) is not type(expected_start_index)
             or chunk["cue_index_start"] != expected_start_index
@@ -105,9 +203,80 @@ def _manifest_is_valid(
             or chunk["cue_index_end"] != expected_end_index
         ):
             return False
+
+        source_path = chunks_dir / expected_source_file
+        try:
+            if source_path.is_symlink() or not source_path.is_file():
+                return False
+            actual_source_text = source_path.read_text(encoding="utf-8")
+        except (OSError, UnicodeError):
+            return False
+        if actual_source_text != expected_source_text:
+            return False
         cursor += expected_line_count
 
     return cursor == cue_count
+
+
+def _previous_chunk_binding(
+    manifest: object,
+    number: int,
+    chunks_dir: Path,
+) -> tuple[str | None, Path | None]:
+    """返回旧分块绑定的源 hash 与译文路径；格式异常时不信任。"""
+    if not isinstance(manifest, dict):
+        return None, None
+    chunks = manifest.get("chunks")
+    if not isinstance(chunks, list) or number >= len(chunks):
+        return None, None
+    chunk = chunks[number]
+    if not isinstance(chunk, dict) or chunk.get("number") != number:
+        return None, None
+
+    source_name = f"chunk_{number:03d}.txt"
+    if chunk.get("source_file") != source_name:
+        return None, None
+    source_path = chunks_dir / source_name
+    try:
+        if source_path.is_symlink() or not source_path.is_file():
+            return None, None
+        source_text = source_path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError):
+        return None, None
+    actual_source_hash = _sha256_text(source_text)
+
+    if manifest.get("schema_version") == 2:
+        recorded_hash = chunk.get("source_sha256")
+        expected_translation = f"chunk_{number:03d}.translated.txt"
+        if (
+            not _is_sha256(recorded_hash)
+            or recorded_hash != actual_source_hash
+            or chunk.get("translation_file") != expected_translation
+        ):
+            return None, None
+        return recorded_hash, chunks_dir / expected_translation
+
+    if manifest.get("schema_version") is None:
+        expected_translation = f"chunk_{number:03d}.zh.txt"
+        if chunk.get("translation_file") != expected_translation:
+            return None, None
+        return actual_source_hash, chunks_dir / expected_translation
+
+    return None, None
+
+
+def _next_stale_path(
+    chunks_dir: Path, number: int, source_hash: str | None
+) -> Path:
+    hash_label = source_hash[:12] if _is_sha256(source_hash) else "unknown"
+    candidate = chunks_dir / f"chunk_{number:03d}.stale-{hash_label}.txt"
+    counter = 2
+    while candidate.exists() or candidate.is_symlink():
+        candidate = chunks_dir / (
+            f"chunk_{number:03d}.stale-{hash_label}-{counter}.txt"
+        )
+        counter += 1
+    return candidate
 
 
 def chunk_subtitles(input_path: Path, size: int, out_dir: Path) -> int:
@@ -116,47 +285,99 @@ def chunk_subtitles(input_path: Path, size: int, out_dir: Path) -> int:
     except (OSError, UnicodeError, srt.SRTParseError):
         print(f"无法读取或解析 SRT 文件：{input_path}", file=sys.stderr)
         return 1
-    out_dir.mkdir(parents=True, exist_ok=True)
-    chunks = []
+    try:
+        out_dir.mkdir(parents=True, exist_ok=True)
+        previous_manifest = _load_manifest(out_dir / "manifest.json")
+        chunks = []
 
-    for number, offset in enumerate(range(0, len(subtitles), size)):
-        chunk = subtitles[offset : offset + size]
-        source_file = f"chunk_{number:03d}.txt"
-        translation_file = f"chunk_{number:03d}.zh.txt"
-        lines = [_one_line(cue.content) for cue in chunk]
-        (out_dir / source_file).write_text(
-            "\n".join(lines) + "\n", encoding="utf-8"
-        )
-        chunks.append(
-            {
-                "number": number,
-                "source_file": source_file,
-                "translation_file": translation_file,
-                "needs_translation": not (
-                    out_dir / translation_file
-                ).is_file(),
-                "line_count": len(chunk),
-                "cue_index_start": chunk[0].index,
-                "cue_index_end": chunk[-1].index,
-            }
-        )
+        for number, offset in enumerate(range(0, len(subtitles), size)):
+            chunk = subtitles[offset : offset + size]
+            source_file = f"chunk_{number:03d}.txt"
+            translation_file = f"chunk_{number:03d}.translated.txt"
+            source_text = _chunk_text(chunk)
+            source_hash = _sha256_text(source_text)
+            translation_path = out_dir / translation_file
+            old_hash, old_translation_path = _previous_chunk_binding(
+                previous_manifest, number, out_dir
+            )
 
-    manifest = {
-        "input_file": str(input_path),
-        "chunk_size": size,
-        "cue_count": len(subtitles),
-        "chunks": chunks,
-    }
-    (out_dir / "manifest.json").write_text(
-        json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-    )
+            translation_exists = (
+                translation_path.exists() or translation_path.is_symlink()
+            )
+            safely_reusable = (
+                translation_exists
+                and not translation_path.is_symlink()
+                and translation_path.is_file()
+                and old_translation_path == translation_path
+                and old_hash == source_hash
+            )
+            if translation_exists and not safely_reusable:
+                stale_path = _next_stale_path(out_dir, number, old_hash)
+                translation_path.replace(stale_path)
+                print(
+                    f"第 {number + 1} 块源文已改变；旧译文已保留为 "
+                    f"{stale_path.name}",
+                    file=sys.stderr,
+                )
+
+            if (
+                not safely_reusable
+                and old_translation_path is not None
+                and old_translation_path != translation_path
+                and old_hash == source_hash
+                and old_translation_path.is_file()
+                and not old_translation_path.is_symlink()
+            ):
+                legacy_translation = old_translation_path.read_text(
+                    encoding="utf-8"
+                )
+                _atomic_write_text(translation_path, legacy_translation)
+                safely_reusable = True
+
+            _atomic_write_text(out_dir / source_file, source_text)
+            chunks.append(
+                {
+                    "number": number,
+                    "source_file": source_file,
+                    "translation_file": translation_file,
+                    "needs_translation": not safely_reusable,
+                    "source_sha256": source_hash,
+                    "line_count": len(chunk),
+                    "cue_index_start": chunk[0].index,
+                    "cue_index_end": chunk[-1].index,
+                }
+            )
+
+        manifest = {
+            "schema_version": 2,
+            "input_file": input_path.name,
+            "input_sha256": _input_sha256(subtitles),
+            "chunk_size": size,
+            "cue_count": len(subtitles),
+            "chunks": chunks,
+        }
+        _atomic_write_text(
+            out_dir / "manifest.json",
+            json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
+        )
+    except (OSError, UnicodeError):
+        print(
+            f"无法写入字幕分块：{out_dir}。请检查目录权限与磁盘空间后重试",
+            file=sys.stderr,
+        )
+        return 1
     return 0
 
 
 def merge_subtitles(
     input_path: Path, chunks_dir: Path, layout: str, output_path: Path
 ) -> int:
+    if _paths_refer_to_same_file(input_path, output_path):
+        print(
+            "输出路径不能与输入 SRT 指向同一文件，请改用其他 --out 路径",
+            file=sys.stderr,
+        )
+        return 2
     try:
         subtitles = _read_subtitles(input_path)
     except (OSError, UnicodeError, srt.SRTParseError):
@@ -167,23 +388,38 @@ def merge_subtitles(
         print("缺少 manifest.json，请先运行 chunk", file=sys.stderr)
         return 2
     manifest = _load_manifest(manifest_path)
-    if not _manifest_is_valid(manifest, subtitles):
+    if not _manifest_is_valid(manifest, subtitles, chunks_dir):
         print("manifest 损坏，请重新运行 chunk", file=sys.stderr)
         return 2
     translations = []
 
     for position, chunk in enumerate(manifest["chunks"], start=1):
         translation_path = chunks_dir / chunk["translation_file"]
-        if not translation_path.is_file():
+        try:
+            translation_is_file = (
+                translation_path.is_file()
+                and not translation_path.is_symlink()
+            )
+        except OSError:
+            translation_is_file = False
+        if not translation_is_file:
             print(
                 f"缺少第 {position} 块译文：{translation_path.name}，"
                 "请翻译该块后重试",
                 file=sys.stderr,
             )
             return 2
-        translated_lines = translation_path.read_text(
-            encoding="utf-8"
-        ).splitlines()
+        try:
+            translated_lines = translation_path.read_text(
+                encoding="utf-8"
+            ).splitlines()
+        except (OSError, UnicodeError):
+            print(
+                f"无法读取第 {position} 块译文：{translation_path.name}，"
+                "请检查文件编码与权限后重试",
+                file=sys.stderr,
+            )
+            return 2
         expected = chunk["line_count"]
         actual = len(translated_lines)
         if actual != expected:
@@ -221,10 +457,19 @@ def merge_subtitles(
             )
         )
 
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_text(
-        srt.compose(merged, reindex=False), encoding="utf-8"
-    )
+    try:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        _atomic_write_text(
+            output_path,
+            srt.compose(merged, reindex=False),
+        )
+    except OSError:
+        print(
+            f"无法写入合并字幕：{output_path}。"
+            "请检查目录权限与磁盘空间后重试",
+            file=sys.stderr,
+        )
+        return 2
     return 0
 
 

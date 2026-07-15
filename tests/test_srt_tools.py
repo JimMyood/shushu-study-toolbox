@@ -1,4 +1,5 @@
 import json
+import importlib.util
 from pathlib import Path
 import subprocess
 import sys
@@ -10,6 +11,14 @@ import srt
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SCRIPT = REPO_ROOT / "scripts" / "srt_tools.py"
 SAMPLE = Path(__file__).resolve().parent / "fixtures" / "sample.srt"
+
+
+def _load_srt_tools():
+    spec = importlib.util.spec_from_file_location("srt_tools_under_test", SCRIPT)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def _run_cli(*args: object) -> subprocess.CompletedProcess[str]:
@@ -99,7 +108,7 @@ def _damage_manifest(manifest: dict, case: str) -> object:
     elif case == "wrong_line_count":
         manifest["chunks"][0]["line_count"] = 1
     elif case == "wrong_translation_file":
-        manifest["chunks"][0]["translation_file"] = "../outside.zh.txt"
+        manifest["chunks"][0]["translation_file"] = "../outside.translated.txt"
     elif case == "wrong_source_file":
         manifest["chunks"][0]["source_file"] = "../outside.txt"
     elif case == "wrong_start_index":
@@ -157,7 +166,7 @@ def test_chunk_then_merge_roundtrip(tmp_path):
 
 def test_chunk_manifest_marks_only_missing_translations_on_resume(tmp_path):
     chunks_dir = _chunk_sample(tmp_path)
-    completed_translation = chunks_dir / "chunk_000.zh.txt"
+    completed_translation = chunks_dir / "chunk_000.translated.txt"
     completed_translation.write_text("已翻译一\n已翻译二\n", encoding="utf-8")
 
     result = _run_cli("chunk", SAMPLE, "--size", 2, "--out-dir", chunks_dir)
@@ -174,6 +183,105 @@ def test_chunk_manifest_marks_only_missing_translations_on_resume(tmp_path):
         True,
         True,
     ]
+
+
+def test_new_manifest_uses_neutral_names_hashes_and_no_absolute_input_path(
+    tmp_path,
+):
+    chunks_dir = _chunk_sample(tmp_path)
+
+    raw_manifest = (chunks_dir / "manifest.json").read_text(encoding="utf-8")
+    manifest = json.loads(raw_manifest)
+
+    assert manifest["schema_version"] == 2
+    assert manifest["input_file"] == SAMPLE.name
+    assert str(SAMPLE) not in raw_manifest
+    assert len(manifest["input_sha256"]) == 64
+    assert all(
+        character in "0123456789abcdef"
+        for character in manifest["input_sha256"]
+    )
+    assert [chunk["translation_file"] for chunk in manifest["chunks"]] == [
+        "chunk_000.translated.txt",
+        "chunk_001.translated.txt",
+        "chunk_002.translated.txt",
+    ]
+    assert all(len(chunk["source_sha256"]) == 64 for chunk in manifest["chunks"])
+
+
+def test_chunk_source_change_with_same_count_and_indexes_stales_only_changed_translation(
+    tmp_path,
+):
+    input_path = tmp_path / "source.srt"
+    input_path.write_text(SAMPLE.read_text(encoding="utf-8"), encoding="utf-8")
+    chunks_dir = tmp_path / "chunks"
+    first = _run_cli("chunk", input_path, "--size", 2, "--out-dir", chunks_dir)
+    assert first.returncode == 0, first.stderr
+    _write_translations(chunks_dir)
+    old_manifest = _read_manifest(chunks_dir)
+    old_translation = (
+        chunks_dir / "chunk_000.translated.txt"
+    ).read_text(encoding="utf-8")
+
+    subtitles = _read_subtitles(input_path)
+    subtitles[0] = srt.Subtitle(
+        index=subtitles[0].index,
+        start=subtitles[0].start,
+        end=subtitles[0].end,
+        content="This source sentence changed.",
+        proprietary=subtitles[0].proprietary,
+    )
+    input_path.write_text(
+        srt.compose(subtitles, reindex=False), encoding="utf-8"
+    )
+
+    resumed = _run_cli(
+        "chunk", input_path, "--size", 2, "--out-dir", chunks_dir
+    )
+
+    assert resumed.returncode == 0, resumed.stderr
+    new_manifest = _read_manifest(chunks_dir)
+    assert new_manifest["input_sha256"] != old_manifest["input_sha256"]
+    assert [chunk["needs_translation"] for chunk in new_manifest["chunks"]] == [
+        True,
+        False,
+        False,
+    ]
+    assert not (chunks_dir / "chunk_000.translated.txt").exists()
+    stale_files = list(chunks_dir.glob("chunk_000.stale-*.txt"))
+    assert len(stale_files) == 1
+    assert stale_files[0].read_text(encoding="utf-8") == old_translation
+    assert (chunks_dir / "chunk_001.translated.txt").is_file()
+
+    output_path = tmp_path / "bilingual.srt"
+    stale_merge = _run_cli(
+        "merge",
+        input_path,
+        "--chunks-dir",
+        chunks_dir,
+        "--layout",
+        "original-top",
+        "--out",
+        output_path,
+    )
+    assert stale_merge.returncode == 2
+    assert "缺少第 1 块译文" in stale_merge.stderr
+    assert not output_path.exists()
+
+    (chunks_dir / "chunk_000.translated.txt").write_text(
+        "新的译文一\n新的译文二\n", encoding="utf-8"
+    )
+    refreshed_merge = _run_cli(
+        "merge",
+        input_path,
+        "--chunks-dir",
+        chunks_dir,
+        "--layout",
+        "original-top",
+        "--out",
+        output_path,
+    )
+    assert refreshed_merge.returncode == 0, refreshed_merge.stderr
 
 
 def test_chunk_rejects_non_positive_size_without_traceback(tmp_path):
@@ -216,7 +324,7 @@ def test_chunk_reports_missing_input_without_traceback(tmp_path):
 def test_merge_rejects_line_count_mismatch(tmp_path):
     chunks_dir = _chunk_sample(tmp_path)
     _write_translations(chunks_dir)
-    (chunks_dir / "chunk_000.zh.txt").write_text(
+    (chunks_dir / "chunk_000.translated.txt").write_text(
         "只有一行\n", encoding="utf-8"
     )
 
@@ -239,7 +347,7 @@ def test_merge_rejects_line_count_mismatch(tmp_path):
 def test_merge_reports_missing_translation_block_without_traceback(tmp_path):
     chunks_dir = _chunk_sample(tmp_path)
     _write_translations(chunks_dir)
-    (chunks_dir / "chunk_001.zh.txt").unlink()
+    (chunks_dir / "chunk_001.translated.txt").unlink()
     output_path = tmp_path / "bilingual.srt"
 
     result = _run_cli(
@@ -255,7 +363,7 @@ def test_merge_reports_missing_translation_block_without_traceback(tmp_path):
 
     assert result.returncode == 2
     assert (
-        "缺少第 2 块译文：chunk_001.zh.txt，请翻译该块后重试"
+        "缺少第 2 块译文：chunk_001.translated.txt，请翻译该块后重试"
         in result.stderr
     )
     assert "Traceback" not in result.stderr
@@ -386,7 +494,7 @@ def test_merge_rejects_unreadable_manifest_path(tmp_path):
 def test_merge_rejects_manifest_structure_corruption(tmp_path, case):
     chunks_dir = _chunk_sample(tmp_path)
     _write_translations(chunks_dir)
-    (tmp_path / "outside.zh.txt").write_text(
+    (tmp_path / "outside.translated.txt").write_text(
         "越权译文一\n越权译文二\n", encoding="utf-8"
     )
     manifest = _damage_manifest(_read_manifest(chunks_dir), case)
@@ -396,6 +504,145 @@ def test_merge_rejects_manifest_structure_corruption(tmp_path, case):
     result = _run_cli(
         "merge",
         SAMPLE,
+        "--chunks-dir",
+        chunks_dir,
+        "--layout",
+        "original-top",
+        "--out",
+        output_path,
+    )
+
+    _assert_manifest_damaged(result, output_path)
+
+
+@pytest.mark.parametrize("field", ["input_sha256", "source_sha256"])
+def test_merge_rejects_tampered_manifest_hash(tmp_path, field):
+    chunks_dir = _chunk_sample(tmp_path)
+    _write_translations(chunks_dir)
+    manifest = _read_manifest(chunks_dir)
+    if field == "input_sha256":
+        manifest[field] = "0" * 64
+    else:
+        manifest["chunks"][0][field] = "0" * 64
+    _write_manifest(chunks_dir, manifest)
+    output_path = tmp_path / "bilingual.srt"
+
+    result = _run_cli(
+        "merge",
+        SAMPLE,
+        "--chunks-dir",
+        chunks_dir,
+        "--layout",
+        "original-top",
+        "--out",
+        output_path,
+    )
+
+    _assert_manifest_damaged(result, output_path)
+
+
+def test_merge_rejects_tampered_source_chunk(tmp_path):
+    chunks_dir = _chunk_sample(tmp_path)
+    _write_translations(chunks_dir)
+    (chunks_dir / "chunk_000.txt").write_text(
+        "被篡改的源文\n仍然有两行\n", encoding="utf-8"
+    )
+    output_path = tmp_path / "bilingual.srt"
+
+    result = _run_cli(
+        "merge",
+        SAMPLE,
+        "--chunks-dir",
+        chunks_dir,
+        "--layout",
+        "original-top",
+        "--out",
+        output_path,
+    )
+
+    _assert_manifest_damaged(result, output_path)
+
+
+def test_merge_reads_legacy_manifest_and_zh_translations_without_writing_them(
+    tmp_path,
+):
+    chunks_dir = _chunk_sample(tmp_path)
+    _write_translations(chunks_dir)
+    manifest = _read_manifest(chunks_dir)
+    manifest.pop("schema_version")
+    manifest.pop("input_sha256")
+    manifest["input_file"] = str(SAMPLE)
+    legacy_contents = {}
+    for chunk in manifest["chunks"]:
+        chunk.pop("source_sha256")
+        translated_path = chunks_dir / chunk["translation_file"]
+        legacy_path = translated_path.with_name(
+            translated_path.name.replace(".translated.txt", ".zh.txt")
+        )
+        translated_path.rename(legacy_path)
+        chunk["translation_file"] = legacy_path.name
+        chunk.pop("needs_translation", None)
+        legacy_contents[legacy_path] = legacy_path.read_text(encoding="utf-8")
+    _write_manifest(chunks_dir, manifest)
+    output_path = tmp_path / "bilingual.srt"
+
+    result = _run_cli(
+        "merge",
+        SAMPLE,
+        "--chunks-dir",
+        chunks_dir,
+        "--layout",
+        "original-top",
+        "--out",
+        output_path,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert output_path.is_file()
+    assert {
+        path: path.read_text(encoding="utf-8") for path in legacy_contents
+    } == legacy_contents
+
+
+def test_merge_legacy_manifest_still_rejects_changed_source_content(tmp_path):
+    input_path = tmp_path / "source.srt"
+    input_path.write_text(SAMPLE.read_text(encoding="utf-8"), encoding="utf-8")
+    chunks_dir = tmp_path / "chunks"
+    chunk_result = _run_cli(
+        "chunk", input_path, "--size", 2, "--out-dir", chunks_dir
+    )
+    assert chunk_result.returncode == 0, chunk_result.stderr
+    _write_translations(chunks_dir)
+    manifest = _read_manifest(chunks_dir)
+    manifest.pop("schema_version")
+    manifest.pop("input_sha256")
+    for chunk in manifest["chunks"]:
+        chunk.pop("source_sha256")
+        translated_path = chunks_dir / chunk["translation_file"]
+        legacy_path = translated_path.with_name(
+            translated_path.name.replace(".translated.txt", ".zh.txt")
+        )
+        translated_path.rename(legacy_path)
+        chunk["translation_file"] = legacy_path.name
+        chunk.pop("needs_translation", None)
+    _write_manifest(chunks_dir, manifest)
+
+    subtitles = _read_subtitles(input_path)
+    subtitles[0] = srt.Subtitle(
+        index=subtitles[0].index,
+        start=subtitles[0].start,
+        end=subtitles[0].end,
+        content="Changed after legacy chunking.",
+        proprietary=subtitles[0].proprietary,
+    )
+    input_path.write_text(
+        srt.compose(subtitles, reindex=False), encoding="utf-8"
+    )
+    output_path = tmp_path / "bilingual.srt"
+
+    result = _run_cli(
+        "merge",
+        input_path,
         "--chunks-dir",
         chunks_dir,
         "--layout",
@@ -454,7 +701,7 @@ def test_merge_reports_missing_input_without_traceback(tmp_path):
 def test_merge_rejects_blank_translation_line(tmp_path, blank_line):
     chunks_dir = _chunk_sample(tmp_path)
     _write_translations(chunks_dir)
-    (chunks_dir / "chunk_000.zh.txt").write_text(
+    (chunks_dir / "chunk_000.translated.txt").write_text(
         f"正常译文\n{blank_line}\n", encoding="utf-8"
     )
     output_path = tmp_path / "bilingual.srt"
@@ -529,6 +776,131 @@ def test_layout_translation_top(tmp_path):
         f"译:{' '.join(cue.content.splitlines())}\n{cue.content}"
         for cue in original
     ]
+
+
+@pytest.mark.parametrize("alias_kind", ["same_path", "symlink", "hardlink"])
+def test_merge_rejects_output_alias_to_input_without_modifying_input(
+    tmp_path, alias_kind
+):
+    input_path = tmp_path / "source.srt"
+    original_content = SAMPLE.read_text(encoding="utf-8")
+    input_path.write_text(original_content, encoding="utf-8")
+    chunks_dir = tmp_path / "chunks"
+    chunk_result = _run_cli(
+        "chunk", input_path, "--size", 2, "--out-dir", chunks_dir
+    )
+    assert chunk_result.returncode == 0, chunk_result.stderr
+    _write_translations(chunks_dir)
+
+    if alias_kind == "same_path":
+        output_path = input_path
+    else:
+        output_path = tmp_path / f"{alias_kind}.srt"
+        try:
+            if alias_kind == "symlink":
+                output_path.symlink_to(input_path)
+            else:
+                output_path.hardlink_to(input_path)
+        except OSError as error:
+            pytest.skip(f"当前平台不能创建 {alias_kind}：{error}")
+
+    result = _run_cli(
+        "merge",
+        input_path,
+        "--chunks-dir",
+        chunks_dir,
+        "--layout",
+        "original-top",
+        "--out",
+        output_path,
+    )
+
+    assert result.returncode == 2
+    assert "输出路径不能与输入 SRT 指向同一文件" in result.stderr
+    assert "Traceback" not in result.stderr
+    assert input_path.read_text(encoding="utf-8") == original_content
+
+
+def test_merge_atomic_replace_failure_preserves_old_output(
+    tmp_path, monkeypatch, capsys
+):
+    srt_tools = _load_srt_tools()
+    chunks_dir = _chunk_sample(tmp_path)
+    _write_translations(chunks_dir)
+    output_path = tmp_path / "bilingual.srt"
+    output_path.write_text("不可丢失的旧字幕", encoding="utf-8")
+    real_replace = Path.replace
+
+    def fail_output_replace(path, target):
+        if Path(target) == output_path:
+            raise OSError("secret replace failure")
+        return real_replace(path, target)
+
+    monkeypatch.setattr(Path, "replace", fail_output_replace)
+
+    exit_code = srt_tools.merge_subtitles(
+        SAMPLE, chunks_dir, "original-top", output_path
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == 2
+    assert "无法写入合并字幕" in captured.err
+    assert "secret" not in captured.err
+    assert output_path.read_text(encoding="utf-8") == "不可丢失的旧字幕"
+    assert set(tmp_path.iterdir()) == {chunks_dir, output_path}
+
+
+def test_chunk_atomic_source_replace_failure_preserves_old_chunk(
+    tmp_path, monkeypatch, capsys
+):
+    srt_tools = _load_srt_tools()
+    chunks_dir = tmp_path / "chunks"
+    chunks_dir.mkdir()
+    source_path = chunks_dir / "chunk_000.txt"
+    source_path.write_text("不可丢失的旧源分块\n", encoding="utf-8")
+    real_replace = Path.replace
+
+    def fail_source_replace(path, target):
+        if Path(target) == source_path:
+            raise OSError("secret replace failure")
+        return real_replace(path, target)
+
+    monkeypatch.setattr(Path, "replace", fail_source_replace)
+
+    exit_code = srt_tools.chunk_subtitles(SAMPLE, 2, chunks_dir)
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert "无法写入字幕分块" in captured.err
+    assert "secret" not in captured.err
+    assert source_path.read_text(encoding="utf-8") == "不可丢失的旧源分块\n"
+    assert set(chunks_dir.iterdir()) == {source_path}
+
+
+def test_chunk_atomic_manifest_replace_failure_preserves_old_manifest(
+    tmp_path, monkeypatch, capsys
+):
+    srt_tools = _load_srt_tools()
+    chunks_dir = _chunk_sample(tmp_path)
+    manifest_path = chunks_dir / "manifest.json"
+    old_manifest = manifest_path.read_text(encoding="utf-8")
+    real_replace = Path.replace
+
+    def fail_manifest_replace(path, target):
+        if Path(target) == manifest_path:
+            raise OSError("secret replace failure")
+        return real_replace(path, target)
+
+    monkeypatch.setattr(Path, "replace", fail_manifest_replace)
+
+    exit_code = srt_tools.chunk_subtitles(SAMPLE, 1, chunks_dir)
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert "无法写入字幕分块" in captured.err
+    assert "secret" not in captured.err
+    assert manifest_path.read_text(encoding="utf-8") == old_manifest
+    assert not list(chunks_dir.glob(".*.tmp"))
 
 
 def test_validate_catches_empty_cue(tmp_path):
