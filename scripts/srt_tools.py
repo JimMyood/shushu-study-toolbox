@@ -35,6 +35,81 @@ def _layout(value: str) -> str:
     return value
 
 
+def _load_manifest(path: Path) -> object | None:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return None
+
+
+def _manifest_is_valid(
+    manifest: object, subtitles: list[srt.Subtitle]
+) -> bool:
+    if not isinstance(manifest, dict):
+        return False
+
+    cue_count = manifest.get("cue_count")
+    chunk_size = manifest.get("chunk_size")
+    chunks = manifest.get("chunks")
+    if type(cue_count) is not int or cue_count != len(subtitles):
+        return False
+    if type(chunk_size) is not int or chunk_size <= 0:
+        return False
+    if not isinstance(chunks, list):
+        return False
+
+    expected_chunk_count = (cue_count + chunk_size - 1) // chunk_size
+    if len(chunks) != expected_chunk_count:
+        return False
+
+    required_fields = {
+        "number",
+        "source_file",
+        "translation_file",
+        "line_count",
+        "cue_index_start",
+        "cue_index_end",
+    }
+    cursor = 0
+    for number, chunk in enumerate(chunks):
+        if not isinstance(chunk, dict):
+            return False
+        if not required_fields.issubset(chunk):
+            return False
+
+        expected_line_count = min(chunk_size, cue_count - cursor)
+        end_cursor = cursor + expected_line_count - 1
+        expected_start_index = subtitles[cursor].index
+        expected_end_index = subtitles[end_cursor].index
+        expected_source_file = f"chunk_{number:03d}.txt"
+        expected_translation_file = f"chunk_{number:03d}.zh.txt"
+
+        if type(chunk["number"]) is not int or chunk["number"] != number:
+            return False
+        if (
+            type(chunk["line_count"]) is not int
+            or chunk["line_count"] != expected_line_count
+        ):
+            return False
+        if chunk["source_file"] != expected_source_file:
+            return False
+        if chunk["translation_file"] != expected_translation_file:
+            return False
+        if (
+            type(chunk["cue_index_start"]) is not type(expected_start_index)
+            or chunk["cue_index_start"] != expected_start_index
+        ):
+            return False
+        if (
+            type(chunk["cue_index_end"]) is not type(expected_end_index)
+            or chunk["cue_index_end"] != expected_end_index
+        ):
+            return False
+        cursor += expected_line_count
+
+    return cursor == cue_count
+
+
 def chunk_subtitles(input_path: Path, size: int, out_dir: Path) -> int:
     try:
         subtitles = _read_subtitles(input_path)
@@ -88,20 +163,12 @@ def merge_subtitles(
         print(f"无法读取或解析 SRT 文件：{input_path}", file=sys.stderr)
         return 2
     manifest_path = chunks_dir / "manifest.json"
-    if not manifest_path.is_file():
+    if not manifest_path.exists():
         print("缺少 manifest.json，请先运行 chunk", file=sys.stderr)
         return 2
-    manifest = json.loads(
-        manifest_path.read_text(encoding="utf-8")
-    )
-    expected_cue_count = manifest["cue_count"]
-    if len(subtitles) != expected_cue_count:
-        print(
-            "原文字幕条数与 manifest 不一致："
-            f"原文 {len(subtitles)}，manifest {expected_cue_count}，"
-            "请重新运行 chunk",
-            file=sys.stderr,
-        )
+    manifest = _load_manifest(manifest_path)
+    if not _manifest_is_valid(manifest, subtitles):
+        print("manifest 损坏，请重新运行 chunk", file=sys.stderr)
         return 2
     translations = []
 
@@ -126,6 +193,16 @@ def merge_subtitles(
                 file=sys.stderr,
             )
             return 2
+        for line_number, translated_line in enumerate(
+            translated_lines, start=1
+        ):
+            if not translated_line.strip():
+                print(
+                    f"第 {position} 块第 {line_number} 行译文为空，"
+                    "请重翻该块",
+                    file=sys.stderr,
+                )
+                return 2
         translations.extend(translated_lines)
 
     merged = []
