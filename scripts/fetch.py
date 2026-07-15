@@ -12,6 +12,7 @@ import sys
 import tempfile
 from typing import Callable, Sequence
 
+import srt
 import yt_dlp
 
 
@@ -290,6 +291,34 @@ def _make_output_dir(out_dir: Path) -> Path:
     return destination
 
 
+def _clean_subtitle_file(path: Path) -> None:
+    try:
+        subtitles = list(srt.parse(path.read_text(encoding="utf-8")))
+    except (OSError, UnicodeError, srt.SRTParseError):
+        raise FetchError(
+            "下载的 SRT 字幕无法读取或解析。"
+            "请更新 yt-dlp 后重试。"
+        ) from None
+
+    cleaned = [cue for cue in subtitles if cue.content.strip()]
+    if not cleaned:
+        raise FetchError(
+            "字幕下载已结束，但字幕内容为空。"
+            "请选择其他字幕语言或来源后重试。"
+        )
+    if len(cleaned) == len(subtitles):
+        return
+    try:
+        path.write_text(
+            srt.compose(cleaned, reindex=False), encoding="utf-8"
+        )
+    except (OSError, UnicodeError):
+        raise FetchError(
+            "下载的 SRT 字幕无法清理。"
+            "请检查输出目录权限后重试。"
+        ) from None
+
+
 def _download_media(
     mode: str,
     url: str,
@@ -372,6 +401,7 @@ def _download_subtitles(
                 "字幕下载已结束，但没有生成唯一的 SRT 文件。"
                 "请更新 yt-dlp 与 ffmpeg 后重试。"
             )
+        _clean_subtitle_file(candidates[0])
         final_path = destination / "subs.orig.srt"
         candidates[0].replace(final_path)
         return final_path

@@ -8,6 +8,7 @@ import ssl
 import sys
 
 import pytest
+import srt
 import yt_dlp
 
 
@@ -26,6 +27,9 @@ def _fake_ydl(
     error=None,
     produce_artifact=True,
     subtitle_artifact="file",
+    subtitle_text=(
+        "1\n00:00:00,000 --> 00:00:01,000\nHello\n"
+    ),
 ):
     state = {"instances": 0, "options": [], "calls": []}
 
@@ -62,7 +66,7 @@ def _fake_ydl(
                     artifact.symlink_to(target)
                 else:
                     artifact.write_text(
-                        "1\n00:00:00,000 --> 00:00:01,000\nHello\n",
+                        subtitle_text,
                         encoding="utf-8",
                     )
 
@@ -456,6 +460,85 @@ def test_cli_subs_downloads_official_track_to_canonical_path(
         "subs.orig.srt"
     }
     assert "Traceback" not in captured.out + captured.err
+
+
+def test_cli_subs_removes_blank_cues_before_atomic_publish(
+    tmp_path, capsys
+):
+    fetch = _fetch_module()
+    output_dir = tmp_path / "out"
+    downloaded_srt = (
+        "1\n00:00:00,100 --> 00:00:01,200\nFirst line\n\n"
+        "2\n00:00:01,300 --> 00:00:01,700\n \t \n\n"
+        "3\n00:00:02,000 --> 00:00:03,400\n"
+        "Third line\ncontinues here\n"
+    )
+    factory, _state = _fake_ydl(
+        {"subtitles": {"en": [{"ext": "srt"}]}},
+        subtitle_text=downloaded_srt,
+    )
+
+    exit_code = fetch.main(
+        [
+            "subs",
+            "https://example.test/video",
+            "--lang",
+            "en",
+            "--out",
+            str(output_dir),
+        ],
+        ydl_factory=factory,
+    )
+
+    captured = capsys.readouterr()
+    subtitle_path = output_dir / "subs.orig.srt"
+    expected = [
+        (cue.index, cue.start, cue.end, cue.content)
+        for cue in srt.parse(downloaded_srt)
+        if cue.content.strip()
+    ]
+    published = list(srt.parse(subtitle_path.read_text(encoding="utf-8")))
+    assert exit_code == 0
+    assert [
+        (cue.index, cue.start, cue.end, cue.content) for cue in published
+    ] == expected
+    assert all(cue.content.strip() for cue in published)
+    srt_tools = importlib.import_module("srt_tools")
+    assert srt_tools.validate_subtitles(subtitle_path) == 0
+    assert "Traceback" not in captured.out + captured.err
+
+
+def test_cli_subs_rejects_all_blank_cues_without_publishing(
+    tmp_path, capsys
+):
+    fetch = _fetch_module()
+    output_dir = tmp_path / "out"
+    factory, _state = _fake_ydl(
+        {"subtitles": {"en": [{"ext": "srt"}]}},
+        subtitle_text=(
+            "1\n00:00:00,000 --> 00:00:01,000\n \t \n\n"
+            "2\n00:00:01,100 --> 00:00:02,000\n   \n"
+        ),
+    )
+
+    exit_code = fetch.main(
+        [
+            "subs",
+            "https://example.test/video",
+            "--lang",
+            "en",
+            "--out",
+            str(output_dir),
+        ],
+        ydl_factory=factory,
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert "字幕内容为空" in captured.err
+    assert "请" in captured.err
+    assert "Traceback" not in captured.out + captured.err
+    assert not (output_dir / "subs.orig.srt").exists()
 
 
 def test_cli_subs_uses_automatic_caption_only_after_official_miss(
