@@ -12,21 +12,32 @@
 - 在仓库根目录运行，并确认 `scripts/srt_tools.py` 可用。
 - 输入必须是 UTF-8 SRT，例如 `<ITEM_DIR>/subs.orig.srt`。
 - 以下代码块以 Bash/zsh 展示；PowerShell 请用实际值替换变量后逐条运行。
-- 从 `config.json` 读取 `native_lang` 与 `subtitle_layout`；默认分别为 `zh`
-  和 `original-top`，不得假定用户一定使用中文。
+- 复用本次 `common.py prepare` JSON 中的 `item_dir`、`native_lang` 与
+  `subtitle_layout`；不假定用户一定使用中文，不硬编码字幕布局。
 - 翻译由当前 agent 按块完成，不调用未获用户许可的外部服务。
 - 质量口径：忠实原意、术语准确、口语字幕不逐字硬译、保留说话人语气。
 - 一条原文必须对应一行译文；不能合并、拆分、加序号或留空行。
 
 ## 步骤
 
-1. 设置本次路径；把示例目录替换为真实素材目录：
+1. 流水线中复用已解析的 prepare JSON，不重复准备目录。只有独立启动、
+   尚未 prepare 时才先运行：
 
 ```bash
-ITEM_DIR="$HOME/ShushuStudy/2026-07-15-example"
+TITLE='素材的真实标题'
+python scripts/common.py prepare --title "$TITLE"
+```
+
+解析 stdout JSON，把 `item_dir`、`native_lang`、`subtitle_layout` 记为
+`ITEM_DIR`、`NATIVE_LANG`、`SUBTITLE_LAYOUT`，并保留其余配置。下方路径
+均基于同一个 `ITEM_DIR`：
+
+```bash
 SOURCE_SRT="$ITEM_DIR/subs.orig.srt"
 CHUNKS_DIR="$ITEM_DIR/translation-chunks"
 ```
+
+- 译文使用 `NATIVE_LANG`；只有用户明确要求本次临时覆盖时才换语言或布局。
 
 2. 先校验原文时间轴：
 
@@ -83,13 +94,13 @@ python -c 'from pathlib import Path; import sys; a=Path(sys.argv[1]).read_text(e
   的 `needs_translation` 状态更新为 `false`，然后合并。
 - 不能用“看起来都翻了”代替逐个文件核对。
 
-6. 所有块完成后合并双语字幕；以下为原文在上：
+6. 所有块完成后，按 prepare JSON 中的布局合并双语字幕：
 
 ```bash
-python scripts/srt_tools.py merge "$SOURCE_SRT" --chunks-dir "$CHUNKS_DIR" --layout original-top --out "$ITEM_DIR/subs.bi.srt"
+python scripts/srt_tools.py merge "$SOURCE_SRT" --chunks-dir "$CHUNKS_DIR" --layout "$SUBTITLE_LAYOUT" --out "$ITEM_DIR/subs.bi.srt"
 ```
 
-- 若配置为 `translation-top`，只把 `--layout` 改为 `translation-top`。
+- 不手工改写 `--layout`；它必须是本次 JSON 的真实值。
 - exit 0：生成双语 SRT，继续最终校验。
 - exit 2：源 hash/manifest 不匹配、缺块、行数不符、译文有空行，或输出与输入
   指向同一文件；按提示修复，不要绕过校验。

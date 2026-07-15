@@ -9,7 +9,8 @@
 
 ## 前置
 
-- 在仓库根目录运行，并先执行 `python3 scripts/doctor.py`。
+- 在仓库根目录运行，并先执行 `python scripts/doctor.py`。
+- 复用本次 `common.py prepare` JSON 的同一个 `item_dir`；不手工拼路径或另建目录。
 - 准备 `<ITEM_DIR>/video.mp4` 与通过校验的 SRT 字幕。
 - 以下代码块以 Bash/zsh 展示；PowerShell 请用实际值替换变量后逐条运行。
 - 优先使用 `<ITEM_DIR>/subs.bi.srt`；只有用户明确要单语时才换文件。
@@ -21,10 +22,11 @@
 
 ## 步骤
 
-1. 设置素材目录与输入路径：
+1. 流水线中直接复用已解析的 `ITEM_DIR`。只有独立启动、尚未 prepare 时
+   才运行 `python scripts/common.py prepare --title "$TITLE"`，并将返回 JSON
+   的 `item_dir` 记为 `ITEM_DIR`。然后设置输入：
 
 ```bash
-ITEM_DIR="$HOME/ShushuStudy/2026-07-15-example"
 VIDEO="$ITEM_DIR/video.mp4"
 SUBTITLE="$ITEM_DIR/subs.bi.srt"
 ```
@@ -32,7 +34,7 @@ SUBTITLE="$ITEM_DIR/subs.bi.srt"
 2. 先校验字幕，校验失败时禁止封装：
 
 ```bash
-python3 scripts/srt_tools.py validate "$SUBTITLE"
+python scripts/srt_tools.py validate "$SUBTITLE"
 ```
 
 - exit 0：字幕可解析，继续。
@@ -43,7 +45,7 @@ python3 scripts/srt_tools.py validate "$SUBTITLE"
 3. 用户选择可开关的软字幕时运行：
 
 ```bash
-python3 scripts/mux.py soft "$VIDEO" "$SUBTITLE" --out "$ITEM_DIR/video.soft.mp4"
+python scripts/mux.py soft "$VIDEO" "$SUBTITLE" --out "$ITEM_DIR/video.soft.mp4"
 ```
 
 4. 软字幕命令的分支处理：
@@ -56,13 +58,13 @@ python3 scripts/mux.py soft "$VIDEO" "$SUBTITLE" --out "$ITEM_DIR/video.soft.mp4
 5. 用户明确选择永久显示的硬字幕时，先提示会重编码，再运行：
 
 ```bash
-python3 scripts/mux.py burn "$VIDEO" "$SUBTITLE" --out "$ITEM_DIR/video.burn.mp4"
+python scripts/mux.py burn "$VIDEO" "$SUBTITLE" --out "$ITEM_DIR/video.burn.mp4"
 ```
 
 - 默认字体不合适时，可显式覆盖已安装的中文字体：
 
 ```bash
-python3 scripts/mux.py burn "$VIDEO" "$SUBTITLE" --font "Noto Sans CJK SC" --out "$ITEM_DIR/video.burn.mp4"
+python scripts/mux.py burn "$VIDEO" "$SUBTITLE" --font "Noto Sans CJK SC" --out "$ITEM_DIR/video.burn.mp4"
 ```
 
 - `--font` 必须是系统能精确匹配、当前用户可读且含中文字形的字体；名称不能包含逗号、等号或引号。
@@ -78,7 +80,7 @@ python3 scripts/mux.py burn "$VIDEO" "$SUBTITLE" --font "Noto Sans CJK SC" --out
 7. 检查最终文件存在且非空：
 
 ```bash
-python3 -c 'from pathlib import Path; import sys; p=Path(sys.argv[1]); ok=p.is_file() and p.stat().st_size>0; print("文件存在且非空" if ok else "文件缺失或为空"); raise SystemExit(not ok)' "$ITEM_DIR/video.soft.mp4"
+python -c 'from pathlib import Path; import sys; p=Path(sys.argv[1]); ok=p.is_file() and p.stat().st_size>0; print("文件存在且非空" if ok else "文件缺失或为空"); raise SystemExit(not ok)' "$ITEM_DIR/video.soft.mp4"
 ```
 
 - 上面用于软字幕产物；硬字幕时把文件名改为 `video.burn.mp4`。

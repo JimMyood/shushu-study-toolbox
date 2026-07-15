@@ -26,6 +26,7 @@ def _fake_ydl(
     *,
     error=None,
     produce_artifact=True,
+    media_artifact="file",
     subtitle_artifact="file",
     subtitle_text=(
         "1\n00:00:00,000 --> 00:00:01,000\nHello\n"
@@ -50,10 +51,24 @@ def _fake_ydl(
             template.parent.mkdir(parents=True, exist_ok=True)
             if template.name == "audio.%(ext)s":
                 artifact = Path(str(template).replace("%(ext)s", "m4a"))
-                artifact.write_bytes(b"fake-m4a")
+                if media_artifact == "directory":
+                    artifact.mkdir()
+                elif media_artifact == "symlink":
+                    target = template.parent.parent.parent / "outside-media"
+                    target.write_bytes(b"outside-audio")
+                    artifact.symlink_to(target)
+                else:
+                    artifact.write_bytes(b"fake-m4a")
             elif template.name == "video.%(ext)s":
                 artifact = Path(str(template).replace("%(ext)s", "mp4"))
-                artifact.write_bytes(b"fake-mp4")
+                if media_artifact == "directory":
+                    artifact.mkdir()
+                elif media_artifact == "symlink":
+                    target = template.parent.parent.parent / "outside-media"
+                    target.write_bytes(b"outside-video")
+                    artifact.symlink_to(target)
+                else:
+                    artifact.write_bytes(b"fake-mp4")
             elif template.name == "subs.orig.%(ext)s":
                 artifact = template.parent / "subs.orig.downloaded.srt"
                 if subtitle_artifact == "directory":
@@ -678,7 +693,10 @@ def test_cli_subs_publish_failure_preserves_existing_regular_file(
     real_replace = fetch._replace_file
 
     def fail_subtitle_publish(source, destination):
-        if destination == subtitle_path:
+        if (
+            destination == subtitle_path
+            and source.parent.name != "backups"
+        ):
             raise OSError("secret subtitle publish failure")
         return real_replace(source, destination)
 
@@ -703,6 +721,90 @@ def test_cli_subs_publish_failure_preserves_existing_regular_file(
     assert "字幕发布失败" in captured.err
     assert "secret" not in captured.out + captured.err
     assert "Traceback" not in captured.out + captured.err
+
+
+def test_cli_subs_recovers_when_old_backup_move_succeeds_then_raises(
+    tmp_path, monkeypatch, capsys
+):
+    fetch = _fetch_module()
+    output_dir = tmp_path / "out"
+    output_dir.mkdir()
+    subtitle_path = output_dir / "subs.orig.srt"
+    previous = b"only-old-subtitle"
+    subtitle_path.write_bytes(previous)
+    factory, _state = _fake_ydl(
+        {"subtitles": {"en": [{"ext": "vtt"}]}}
+    )
+    real_replace = fetch._replace_file
+
+    def backup_then_raise(source, destination):
+        if (
+            source == subtitle_path
+            and destination.parent.name == "backups"
+        ):
+            real_replace(source, destination)
+            raise OSError("secret post-move subtitle backup error")
+        return real_replace(source, destination)
+
+    monkeypatch.setattr(fetch, "_replace_file", backup_then_raise)
+
+    exit_code = fetch.main(
+        [
+            "subs",
+            "https://example.test/video",
+            "--lang",
+            "en",
+            "--out",
+            str(output_dir),
+        ],
+        ydl_factory=factory,
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert subtitle_path.read_bytes() == previous
+    assert list(output_dir.glob(".fetch-*")) == []
+    assert "原输出状态已恢复" in captured.err
+    assert "secret" not in captured.out + captured.err
+
+
+def test_cli_subs_removes_new_file_when_publish_succeeds_then_raises(
+    tmp_path, monkeypatch, capsys
+):
+    fetch = _fetch_module()
+    output_dir = tmp_path / "out"
+    subtitle_path = output_dir / "subs.orig.srt"
+    factory, _state = _fake_ydl(
+        {"subtitles": {"en": [{"ext": "vtt"}]}}
+    )
+    real_replace = fetch._replace_file
+
+    def publish_then_raise(source, destination):
+        if destination == subtitle_path:
+            real_replace(source, destination)
+            raise OSError("secret post-move subtitle publish error")
+        return real_replace(source, destination)
+
+    monkeypatch.setattr(fetch, "_replace_file", publish_then_raise)
+
+    exit_code = fetch.main(
+        [
+            "subs",
+            "https://example.test/video",
+            "--lang",
+            "en",
+            "--out",
+            str(output_dir),
+        ],
+        ydl_factory=factory,
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert not subtitle_path.exists()
+    assert list(output_dir.glob(".fetch-*")) == []
+    assert "原输出状态已恢复" in captured.err
+    assert "secret" not in captured.out + captured.err
 
 
 def test_cli_subs_uses_automatic_caption_only_after_official_miss(
@@ -956,6 +1058,255 @@ def test_cli_audio_preflights_symlink_slot_before_network(tmp_path, capsys):
     assert "Traceback" not in captured.out + captured.err
 
 
+def test_cli_rejects_symlink_output_directory_before_network(tmp_path, capsys):
+    real_output = tmp_path / "real-output"
+    real_output.mkdir()
+    linked_output = tmp_path / "linked-output"
+    try:
+        linked_output.symlink_to(real_output, target_is_directory=True)
+    except (NotImplementedError, OSError):
+        pytest.skip("当前平台不允许创建测试 symlink")
+    fetch = _fetch_module()
+    factory, state = _fake_ydl({"title": "must not download"})
+
+    exit_code = fetch.main(
+        [
+            "audio",
+            "https://example.test/video",
+            "--out",
+            str(linked_output),
+        ],
+        ydl_factory=factory,
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert state["instances"] == 0
+    assert state["calls"] == []
+    assert list(real_output.iterdir()) == []
+    assert linked_output.is_symlink()
+    assert "输出目录" in captured.err
+    assert "符号链接" in captured.err
+    assert "Traceback" not in captured.out + captured.err
+
+
+@pytest.mark.parametrize(
+    ("mode", "artifact_kind"),
+    [
+        ("audio", "directory"),
+        ("audio", "symlink"),
+        ("video", "directory"),
+        ("video", "symlink"),
+    ],
+)
+def test_cli_rejects_non_regular_staged_media_without_following_it(
+    tmp_path, capsys, mode, artifact_kind
+):
+    fetch = _fetch_module()
+    output_dir = tmp_path / "out"
+    factory, _state = _fake_ydl(
+        {"title": "malicious"}, media_artifact=artifact_kind
+    )
+    arguments = [mode, "https://example.test/video"]
+    if mode == "video":
+        arguments.extend(["--quality", "720"])
+    arguments.extend(["--out", str(output_dir)])
+
+    exit_code = fetch.main(arguments, ydl_factory=factory)
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    if artifact_kind == "symlink":
+        assert (output_dir / "outside-media").read_bytes().startswith(
+            b"outside"
+        )
+    assert not (output_dir / "audio.m4a").exists()
+    assert not (output_dir / "video.mp4").exists()
+    assert not (output_dir / "meta.json").exists()
+    assert "不是普通文件" in captured.err
+    assert "Traceback" not in captured.out + captured.err
+
+
+def test_cli_video_rejects_symlinked_staged_metadata(
+    tmp_path, monkeypatch, capsys
+):
+    fetch = _fetch_module()
+    output_dir = tmp_path / "out"
+    factory, _state = _fake_ydl({"title": "malicious"})
+    outside = output_dir / "outside-meta"
+
+    def write_symlink_metadata(_info, _url, path):
+        outside.write_bytes(b"outside-metadata")
+        path.symlink_to(outside)
+
+    monkeypatch.setattr(fetch, "write_metadata", write_symlink_metadata)
+
+    exit_code = fetch.main(
+        [
+            "video",
+            "https://example.test/video",
+            "--out",
+            str(output_dir),
+        ],
+        ydl_factory=factory,
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert outside.read_bytes() == b"outside-metadata"
+    assert not (output_dir / "video.mp4").exists()
+    assert not (output_dir / "meta.json").exists()
+    assert "meta.json" in captured.err
+    assert "不是普通文件" in captured.err
+    assert "Traceback" not in captured.out + captured.err
+
+
+def test_cli_audio_recovers_when_old_backup_move_succeeds_then_raises(
+    tmp_path, monkeypatch, capsys
+):
+    fetch = _fetch_module()
+    output_dir = tmp_path / "out"
+    output_dir.mkdir()
+    audio_path = output_dir / "audio.m4a"
+    previous = b"only-old-audio"
+    audio_path.write_bytes(previous)
+    factory, _state = _fake_ydl({"title": "new"})
+    real_replace = fetch._replace_file
+
+    def backup_then_raise(source, destination):
+        if source == audio_path and destination.parent.name == "backups":
+            real_replace(source, destination)
+            raise OSError("secret post-move audio backup error")
+        return real_replace(source, destination)
+
+    monkeypatch.setattr(fetch, "_replace_file", backup_then_raise)
+
+    exit_code = fetch.main(
+        [
+            "audio",
+            "https://example.test/video",
+            "--out",
+            str(output_dir),
+        ],
+        ydl_factory=factory,
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert audio_path.read_bytes() == previous
+    assert list(output_dir.glob(".fetch-*")) == []
+    assert "原输出状态已恢复" in captured.err
+    assert "secret" not in captured.out + captured.err
+
+
+def test_cli_audio_recovers_old_when_publish_succeeds_then_raises(
+    tmp_path, monkeypatch, capsys
+):
+    fetch = _fetch_module()
+    output_dir = tmp_path / "out"
+    output_dir.mkdir()
+    audio_path = output_dir / "audio.m4a"
+    previous = b"old-audio"
+    audio_path.write_bytes(previous)
+    factory, _state = _fake_ydl({"title": "new"})
+    real_replace = fetch._replace_file
+
+    def publish_then_raise(source, destination):
+        if source.parent.name == "new" and destination == audio_path:
+            real_replace(source, destination)
+            raise OSError("secret post-move audio publish error")
+        return real_replace(source, destination)
+
+    monkeypatch.setattr(fetch, "_replace_file", publish_then_raise)
+
+    exit_code = fetch.main(
+        [
+            "audio",
+            "https://example.test/video",
+            "--out",
+            str(output_dir),
+        ],
+        ydl_factory=factory,
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert audio_path.read_bytes() == previous
+    assert list(output_dir.glob(".fetch-*")) == []
+    assert "原输出状态已恢复" in captured.err
+    assert "secret" not in captured.out + captured.err
+
+
+def test_cli_does_not_overwrite_slot_created_during_download(
+    tmp_path, monkeypatch, capsys
+):
+    fetch = _fetch_module()
+    output_dir = tmp_path / "out"
+    audio_path = output_dir / "audio.m4a"
+    factory, _state = _fake_ydl({"title": "new"})
+    real_extract = fetch._extract_info
+
+    def extract_then_external_write(*args, **kwargs):
+        info = real_extract(*args, **kwargs)
+        audio_path.write_bytes(b"external-race")
+        return info
+
+    monkeypatch.setattr(fetch, "_extract_info", extract_then_external_write)
+
+    exit_code = fetch.main(
+        [
+            "audio",
+            "https://example.test/video",
+            "--out",
+            str(output_dir),
+        ],
+        ydl_factory=factory,
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert audio_path.read_bytes() == b"external-race"
+    assert list(output_dir.glob(".fetch-*")) == []
+    assert "下载期间输出槽位发生了变化" in captured.err
+
+
+def test_cli_keeps_unknown_racing_destination_and_recovery_staging(
+    tmp_path, monkeypatch, capsys
+):
+    fetch = _fetch_module()
+    output_dir = tmp_path / "out"
+    audio_path = output_dir / "audio.m4a"
+    factory, _state = _fake_ydl({"title": "new"})
+    real_replace = fetch._replace_file
+
+    def create_unknown_destination(source, destination):
+        if destination == audio_path:
+            destination.write_bytes(b"external-race")
+            raise OSError("secret racing writer")
+        return real_replace(source, destination)
+
+    monkeypatch.setattr(fetch, "_replace_file", create_unknown_destination)
+
+    exit_code = fetch.main(
+        [
+            "audio",
+            "https://example.test/video",
+            "--out",
+            str(output_dir),
+        ],
+        ydl_factory=factory,
+    )
+
+    captured = capsys.readouterr()
+    recovery = list(output_dir.glob(".fetch-*"))
+    assert exit_code == 1
+    assert audio_path.read_bytes() == b"external-race"
+    assert len(recovery) == 1
+    assert str(recovery[0]) in captured.err
+    assert "自动回滚也未完成" in captured.err
+    assert "secret" not in captured.out + captured.err
+
+
 def test_cli_video_produces_canonical_video_and_metadata(tmp_path):
     fetch = _fetch_module()
     output_dir = tmp_path / "out"
@@ -1173,6 +1524,349 @@ def test_cli_video_keeps_recovery_directory_when_rollback_fails(
     assert "RECOVERY.txt" in captured.err
     assert "secret" not in captured.out + captured.err
     assert "Traceback" not in captured.out + captured.err
+
+
+def test_cli_video_recovers_when_backup_move_succeeds_then_raises(
+    tmp_path, monkeypatch, capsys
+):
+    fetch = _fetch_module()
+    output_dir = tmp_path / "out"
+    output_dir.mkdir()
+    video_path = output_dir / "video.mp4"
+    metadata_path = output_dir / "meta.json"
+    video_path.write_bytes(b"only-old-video")
+    metadata_path.write_bytes(b"only-old-metadata")
+    factory, _state = _fake_ydl({"title": "new"})
+    real_replace = fetch._replace_file
+
+    def move_video_backup_then_raise(source, destination):
+        if source == video_path and destination.parent.name == "backups":
+            real_replace(source, destination)
+            raise OSError("secret post-move backup error")
+        return real_replace(source, destination)
+
+    monkeypatch.setattr(
+        fetch, "_replace_file", move_video_backup_then_raise
+    )
+
+    exit_code = fetch.main(
+        [
+            "video",
+            "https://example.test/video",
+            "--out",
+            str(output_dir),
+        ],
+        ydl_factory=factory,
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert video_path.read_bytes() == b"only-old-video"
+    assert metadata_path.read_bytes() == b"only-old-metadata"
+    assert list(output_dir.glob(".fetch-*")) == []
+    assert "原输出状态已恢复" in captured.err
+    assert "secret" not in captured.out + captured.err
+
+
+def test_cli_video_removes_both_new_files_when_meta_move_succeeds_then_raises(
+    tmp_path, monkeypatch, capsys
+):
+    fetch = _fetch_module()
+    output_dir = tmp_path / "out"
+    factory, _state = _fake_ydl({"title": "new"})
+    video_path = output_dir / "video.mp4"
+    metadata_path = output_dir / "meta.json"
+    real_replace = fetch._replace_file
+
+    def publish_meta_then_raise(source, destination):
+        if source.name == "meta.json" and destination == metadata_path:
+            real_replace(source, destination)
+            raise OSError("secret post-move metadata error")
+        return real_replace(source, destination)
+
+    monkeypatch.setattr(fetch, "_replace_file", publish_meta_then_raise)
+
+    exit_code = fetch.main(
+        [
+            "video",
+            "https://example.test/video",
+            "--out",
+            str(output_dir),
+        ],
+        ydl_factory=factory,
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert not video_path.exists()
+    assert not metadata_path.exists()
+    assert list(output_dir.glob(".fetch-*")) == []
+    assert "原输出状态已恢复" in captured.err
+    assert "secret" not in captured.out + captured.err
+
+
+@pytest.mark.parametrize("interruption", [KeyboardInterrupt(), SystemExit(9)])
+@pytest.mark.parametrize("stage", ["backup", "publish"])
+def test_cli_video_rolls_back_and_reraises_interruptions(
+    tmp_path, monkeypatch, interruption, stage
+):
+    fetch = _fetch_module()
+    output_dir = tmp_path / "out"
+    output_dir.mkdir()
+    video_path = output_dir / "video.mp4"
+    metadata_path = output_dir / "meta.json"
+    video_path.write_bytes(b"old-video")
+    metadata_path.write_bytes(b"old-metadata")
+    factory, _state = _fake_ydl({"title": "new"})
+    real_replace = fetch._replace_file
+
+    def move_then_interrupt(source, destination):
+        is_backup = (
+            source == video_path and destination.parent.name == "backups"
+        )
+        is_publish = (
+            source.parent.name == "new"
+            and source.name == "video.mp4"
+            and destination == video_path
+        )
+        if (stage == "backup" and is_backup) or (
+            stage == "publish" and is_publish
+        ):
+            real_replace(source, destination)
+            raise interruption
+        return real_replace(source, destination)
+
+    monkeypatch.setattr(fetch, "_replace_file", move_then_interrupt)
+
+    with pytest.raises(type(interruption)) as caught:
+        fetch.main(
+            [
+                "video",
+                "https://example.test/video",
+                "--out",
+                str(output_dir),
+            ],
+            ydl_factory=factory,
+        )
+
+    assert caught.value is interruption
+    assert video_path.read_bytes() == b"old-video"
+    assert metadata_path.read_bytes() == b"old-metadata"
+    assert list(output_dir.glob(".fetch-*")) == []
+
+
+def test_cli_video_interrupt_with_failed_rollback_keeps_recovery(
+    tmp_path, monkeypatch, capsys
+):
+    fetch = _fetch_module()
+    output_dir = tmp_path / "out"
+    output_dir.mkdir()
+    video_path = output_dir / "video.mp4"
+    metadata_path = output_dir / "meta.json"
+    video_path.write_bytes(b"old-video")
+    metadata_path.write_bytes(b"old-metadata")
+    factory, _state = _fake_ydl({"title": "new"})
+    real_replace = fetch._replace_file
+    interruption = KeyboardInterrupt()
+
+    def interrupt_publish_and_fail_restore(source, destination):
+        if (
+            source.parent.name == "new"
+            and source.name == "video.mp4"
+            and destination == video_path
+        ):
+            real_replace(source, destination)
+            raise interruption
+        if (
+            source.parent.name == "backups"
+            and source.name == "video.mp4"
+            and destination == video_path
+        ):
+            raise OSError("secret rollback error")
+        return real_replace(source, destination)
+
+    monkeypatch.setattr(
+        fetch, "_replace_file", interrupt_publish_and_fail_restore
+    )
+
+    try:
+        exit_code = fetch.main(
+            [
+                "video",
+                "https://example.test/video",
+                "--out",
+                str(output_dir),
+            ],
+            ydl_factory=factory,
+        )
+    except KeyboardInterrupt:
+        pytest.fail("回滚失败时不得让 KeyboardInterrupt 跳过恢复诊断")
+
+    captured = capsys.readouterr()
+    recovery_dirs = list(output_dir.glob(".fetch-*"))
+    assert exit_code == 1
+    assert len(recovery_dirs) == 1
+    assert (
+        recovery_dirs[0] / "backups" / "video.mp4"
+    ).read_bytes() == b"old-video"
+    assert (recovery_dirs[0] / "RECOVERY.txt").is_file()
+    assert str(recovery_dirs[0]) in captured.err
+    assert "自动回滚也未完成" in captured.err
+    assert "secret" not in captured.out + captured.err
+
+
+def test_recovery_message_does_not_promise_guide_when_guide_write_fails(
+    tmp_path, monkeypatch, capsys
+):
+    fetch = _fetch_module()
+    output_dir = tmp_path / "out"
+    output_dir.mkdir()
+    video_path = output_dir / "video.mp4"
+    metadata_path = output_dir / "meta.json"
+    video_path.write_bytes(b"old-video")
+    metadata_path.write_bytes(b"old-metadata")
+    factory, _state = _fake_ydl({"title": "new"})
+    real_replace = fetch._replace_file
+
+    def fail_publish_and_restore(source, destination):
+        if source.name == "meta.json" and source.parent.name == "new":
+            raise OSError("secret publish error")
+        if (
+            source.parent.name == "backups"
+            and source.name == "video.mp4"
+            and destination == video_path
+        ):
+            raise OSError("secret rollback error")
+        return real_replace(source, destination)
+
+    monkeypatch.setattr(fetch, "_replace_file", fail_publish_and_restore)
+    monkeypatch.setattr(fetch, "_write_recovery_guide", lambda *_: False)
+
+    exit_code = fetch.main(
+        [
+            "video",
+            "https://example.test/video",
+            "--out",
+            str(output_dir),
+        ],
+        ydl_factory=factory,
+    )
+
+    captured = capsys.readouterr()
+    recovery_dirs = list(output_dir.glob(".fetch-*"))
+    assert exit_code == 1
+    assert len(recovery_dirs) == 1
+    assert not (recovery_dirs[0] / "RECOVERY.txt").exists()
+    assert str(recovery_dirs[0]) in captured.err
+    assert "RECOVERY.txt" not in captured.err
+    assert "恢复说明写入失败" in captured.err
+    assert "secret" not in captured.out + captured.err
+
+
+def test_success_cleanup_removes_backups_first(tmp_path, monkeypatch):
+    fetch = _fetch_module()
+    output_dir = tmp_path / "out"
+    output_dir.mkdir()
+    (output_dir / "video.mp4").write_bytes(b"old-video")
+    (output_dir / "meta.json").write_bytes(b"old-meta")
+    factory, _state = _fake_ydl({"title": "new"})
+    real_rmtree = fetch.shutil.rmtree
+    cleaned = []
+
+    def record_cleanup(path, *args, **kwargs):
+        cleaned.append(Path(path).name)
+        return real_rmtree(path, *args, **kwargs)
+
+    monkeypatch.setattr(fetch.shutil, "rmtree", record_cleanup)
+
+    assert fetch.main(
+        [
+            "video",
+            "https://example.test/video",
+            "--out",
+            str(output_dir),
+        ],
+        ydl_factory=factory,
+    ) == 0
+
+    assert cleaned[0] == "backups"
+    assert len(cleaned) >= 2
+    assert list(output_dir.glob(".fetch-*")) == []
+
+
+def test_cleanup_failure_warns_with_residual_path(
+    tmp_path, monkeypatch, capsys
+):
+    fetch = _fetch_module()
+    output_dir = tmp_path / "out"
+    output_dir.mkdir()
+    (output_dir / "video.mp4").write_bytes(b"old-video")
+    (output_dir / "meta.json").write_bytes(b"old-meta")
+    factory, _state = _fake_ydl({"title": "new"})
+
+    def fail_cleanup(_path, *args, **kwargs):
+        raise OSError("secret cleanup error")
+
+    monkeypatch.setattr(fetch.shutil, "rmtree", fail_cleanup)
+
+    exit_code = fetch.main(
+        [
+            "video",
+            "https://example.test/video",
+            "--out",
+            str(output_dir),
+        ],
+        ydl_factory=factory,
+    )
+
+    captured = capsys.readouterr()
+    residual = list(output_dir.glob(".fetch-*"))
+    assert exit_code == 0
+    assert len(residual) == 1
+    assert str(residual[0]) in captured.err
+    assert "临时目录清理失败" in captured.err
+    assert "手动删除" in captured.err
+    assert "secret" not in captured.out + captured.err
+
+
+def test_backup_cleanup_failure_does_not_silently_delete_staging(
+    tmp_path, monkeypatch, capsys
+):
+    fetch = _fetch_module()
+    output_dir = tmp_path / "out"
+    output_dir.mkdir()
+    (output_dir / "video.mp4").write_bytes(b"old-video")
+    (output_dir / "meta.json").write_bytes(b"old-meta")
+    factory, _state = _fake_ydl({"title": "new"})
+    real_rmtree = fetch.shutil.rmtree
+
+    def fail_only_backups(path, *args, **kwargs):
+        if Path(path).name == "backups":
+            raise OSError("secret backup cleanup error")
+        return real_rmtree(path, *args, **kwargs)
+
+    monkeypatch.setattr(fetch.shutil, "rmtree", fail_only_backups)
+
+    exit_code = fetch.main(
+        [
+            "video",
+            "https://example.test/video",
+            "--out",
+            str(output_dir),
+        ],
+        ydl_factory=factory,
+    )
+
+    captured = capsys.readouterr()
+    residual = list(output_dir.glob(".fetch-*"))
+    assert exit_code == 0
+    assert len(residual) == 1
+    assert (residual[0] / "backups" / "video.mp4").read_bytes() == (
+        b"old-video"
+    )
+    assert str(residual[0]) in captured.err
+    assert "临时目录清理失败" in captured.err
+    assert "secret" not in captured.out + captured.err
 
 
 def test_cli_video_reports_when_no_compatible_mp4_format(

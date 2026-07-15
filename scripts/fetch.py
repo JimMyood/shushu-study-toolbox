@@ -1,6 +1,7 @@
 """使用 yt-dlp 下载学习素材。"""
 
 import argparse
+from dataclasses import dataclass
 from datetime import datetime
 import json
 import math
@@ -354,47 +355,164 @@ def _extract_info(
 
 def _make_output_dir(out_dir: Path) -> Path:
     destination = Path(out_dir).expanduser()
-    destination.mkdir(parents=True, exist_ok=True)
+    if destination.is_symlink():
+        raise FetchError(
+            f"输出目录 {destination} 是符号链接，已拒绝使用。"
+            "请改用真实目录后重试。"
+        )
+    try:
+        destination.mkdir(parents=True, exist_ok=True)
+        mode = destination.lstat().st_mode
+    except OSError:
+        raise FetchError(
+            f"无法写入输出目录 {destination}。"
+            "请检查路径、类型与权限后重试。"
+        ) from None
+    if stat.S_ISLNK(mode) or not stat.S_ISDIR(mode):
+        kind = "符号链接" if stat.S_ISLNK(mode) else "非目录项"
+        raise FetchError(
+            f"输出目录 {destination} 是{kind}，已拒绝使用。"
+            "请改用真实目录后重试。"
+        )
     return destination
 
 
-def _slot_exists(path: Path) -> bool:
-    return path.exists() or path.is_symlink()
+@dataclass(frozen=True)
+class _EntryIdentity:
+    device: int
+    inode: int
+    mode: int
 
 
-def _preflight_slot(path: Path) -> None:
-    """只允许空槽位或现有普通文件，绝不跟随符号链接。"""
-    if path.is_symlink():
-        raise FetchError(
-            f"输出槽位 {path} 是符号链接，已拒绝覆盖。"
-            "请先移开该链接后重试。"
-        )
+@dataclass(frozen=True)
+class _MoveAttempt:
+    moved: bool
+    error: BaseException | None
+
+
+class _TransactionConflict(Exception):
+    """发布槽位或文件身份在事务中发生了竞态变化。"""
+
+
+def _entry_identity(path: Path) -> _EntryIdentity | None:
     try:
-        mode = path.lstat().st_mode
+        current = path.lstat()
     except FileNotFoundError:
-        return
+        return None
+    return _EntryIdentity(current.st_dev, current.st_ino, current.st_mode)
+
+
+def _preflight_slot(path: Path) -> _EntryIdentity | None:
+    """只允许空槽位或现有普通文件，绝不跟随符号链接。"""
+    try:
+        identity = _entry_identity(path)
     except OSError:
         raise FetchError(
             f"无法检查输出槽位 {path}。"
             "请检查路径和权限后重试。"
         ) from None
-    if stat.S_ISREG(mode):
-        return
-    kind = "目录" if stat.S_ISDIR(mode) else "特殊文件"
+    if identity is None:
+        return None
+    if stat.S_ISREG(identity.mode):
+        return identity
+    if stat.S_ISLNK(identity.mode):
+        kind = "符号链接"
+    else:
+        kind = "目录" if stat.S_ISDIR(identity.mode) else "特殊文件"
     raise FetchError(
         f"输出槽位 {path} 已是{kind}，已拒绝覆盖。"
         "请先移开冲突项后重试。"
     )
 
 
-def _preflight_slots(paths: Sequence[Path]) -> None:
-    for path in paths:
-        _preflight_slot(path)
+def _capture_slot_states(
+    paths: Sequence[Path],
+) -> dict[Path, _EntryIdentity | None]:
+    return {path: _preflight_slot(path) for path in paths}
+
+
+def _verify_slot_states(
+    expected: dict[Path, _EntryIdentity | None],
+) -> None:
+    try:
+        unchanged = all(
+            _entry_identity(path) == identity
+            for path, identity in expected.items()
+        )
+    except OSError:
+        unchanged = False
+    if not unchanged:
+        raise FetchError(
+            "下载期间输出槽位发生了变化，新文件未发布。"
+            "请检查输出目录后重试。"
+        )
+
+
+def _require_staged_regular(path: Path, label: str) -> _EntryIdentity:
+    try:
+        identity = _entry_identity(path)
+    except OSError:
+        identity = None
+    if identity is None:
+        raise FetchError(
+            f"下载已结束，但没有生成 {label}。"
+            "请更新 yt-dlp 与 ffmpeg 后重试。"
+        )
+    if not stat.S_ISREG(identity.mode):
+        raise FetchError(
+            f"下载已结束，但临时产物 {label} 不是普通文件。"
+            "请更新 yt-dlp 与 ffmpeg 后重试。"
+        )
+    return identity
 
 
 def _replace_file(source: Path, destination: Path) -> None:
     """为事务测试提供单一、可替换的原子 rename 边界。"""
     source.replace(destination)
+
+
+def _attempt_observed_move(
+    source: Path,
+    destination: Path,
+    expected_source: _EntryIdentity,
+) -> _MoveAttempt:
+    """执行 rename 并用 lstat 确认“返回/抛错后究竟有没有移动”。"""
+    try:
+        if _entry_identity(source) != expected_source:
+            return _MoveAttempt(
+                False,
+                _TransactionConflict("源文件身份已变化"),
+            )
+        if _entry_identity(destination) is not None:
+            return _MoveAttempt(
+                False,
+                _TransactionConflict("目标槽位不再为空"),
+            )
+    except OSError as error:
+        return _MoveAttempt(False, error)
+
+    operation_error: BaseException | None = None
+    try:
+        _replace_file(source, destination)
+    except BaseException as error:
+        operation_error = error
+
+    try:
+        source_after = _entry_identity(source)
+        destination_after = _entry_identity(destination)
+    except OSError as error:
+        return _MoveAttempt(
+            False, operation_error or error
+        )
+    moved = (
+        source_after != expected_source
+        and destination_after == expected_source
+    )
+    if not moved and operation_error is None:
+        operation_error = _TransactionConflict(
+            "rename 返回后文件身份不符合预期"
+        )
+    return _MoveAttempt(moved, operation_error)
 
 
 def _new_staging_dir(destination: Path) -> Path:
@@ -407,78 +525,172 @@ def _new_staging_dir(destination: Path) -> Path:
         ) from None
 
 
-def _write_recovery_guide(staging_dir: Path) -> None:
+def _write_recovery_guide(staging_dir: Path, label: str) -> bool:
     guide = staging_dir / "RECOVERY.txt"
     try:
         guide.write_text(
-            "视频与元数据发布失败，自动回滚未完成。\n"
+            f"{label}发布失败，自动回滚未完成。\n"
             "1. 暂停重试下载，先备份本目录。\n"
             "2. backups/ 中是发布前的旧文件；failed-new/ 中是未发布完整的新文件。\n"
-            "3. 核对输出目录中的 video.mp4 和 meta.json，"
+            "3. 核对输出目录中对应的最终文件，"
             "再将 backups/ 中缺失的旧文件移回。\n",
             encoding="utf-8",
         )
+        return True
     except OSError:
         # 恢复资料本身比说明文件更重要；保留 staging 路径供人工检查。
-        pass
+        return False
 
 
-def _publish_video_pair(
-    staged_video: Path,
-    staged_metadata: Path,
-    final_video: Path,
-    final_metadata: Path,
+def _rollback_transaction(
+    published: list[tuple[Path, _EntryIdentity]],
+    backed_up: list[tuple[Path, Path, _EntryIdentity]],
+    initial_states: dict[Path, _EntryIdentity | None],
     staging_dir: Path,
+) -> bool:
+    failed_new_dir = staging_dir / "failed-new"
+    for final_path, identity in reversed(published):
+        _attempt_observed_move(
+            final_path, failed_new_dir / final_path.name, identity
+        )
+    for final_path, backup_path, identity in reversed(backed_up):
+        try:
+            current_final = _entry_identity(final_path)
+        except OSError:
+            continue
+        if current_final == identity:
+            continue
+        if current_final is not None:
+            # 不覆盖外部竞态产生的未知文件。
+            continue
+        _attempt_observed_move(backup_path, final_path, identity)
+
+    try:
+        return all(
+            _entry_identity(path) == identity
+            for path, identity in initial_states.items()
+        )
+    except OSError:
+        return False
+
+
+def _publish_transaction(
+    staged_and_final: Sequence[tuple[Path, Path]],
+    initial_states: dict[Path, _EntryIdentity | None],
+    staging_dir: Path,
+    label: str,
 ) -> None:
-    """成对发布视频与元数据；任一步失败则恢复旧状态。"""
-    finals = (final_video, final_metadata)
-    staged = (staged_video, staged_metadata)
+    """发布一个或多个文件，并对抛错后已完成的 rename 做观测式回滚。"""
+    _verify_slot_states(initial_states)
     backups_dir = staging_dir / "backups"
     failed_new_dir = staging_dir / "failed-new"
     backups_dir.mkdir()
     failed_new_dir.mkdir()
-    backed_up: list[tuple[Path, Path]] = []
-    published: list[Path] = []
+    backed_up: list[tuple[Path, Path, _EntryIdentity]] = []
+    published: list[tuple[Path, _EntryIdentity]] = []
+    failure: BaseException | None = None
 
-    try:
-        # 下载期间可能有外部程序改动槽位，发布前再检一次。
-        _preflight_slots(finals)
-        for final_path in finals:
-            if _slot_exists(final_path):
-                backup_path = backups_dir / final_path.name
-                _replace_file(final_path, backup_path)
-                backed_up.append((final_path, backup_path))
-        for staged_path, final_path in zip(staged, finals, strict=True):
-            _replace_file(staged_path, final_path)
-            published.append(final_path)
-    except FetchError:
-        raise
-    except OSError:
-        rollback_failed = False
-        for final_path in reversed(published):
+    for _staged_path, final_path in staged_and_final:
+        identity = initial_states[final_path]
+        if identity is None:
+            continue
+        backup_path = backups_dir / final_path.name
+        attempt = _attempt_observed_move(
+            final_path, backup_path, identity
+        )
+        if attempt.moved:
+            backed_up.append((final_path, backup_path, identity))
+        if attempt.error is not None:
+            failure = attempt.error
+            break
+
+    if failure is None:
+        for staged_path, final_path in staged_and_final:
             try:
-                _replace_file(
-                    final_path, failed_new_dir / final_path.name
+                staged_identity = _entry_identity(staged_path)
+            except OSError as error:
+                staged_identity = None
+                failure = error
+            if staged_identity is None or not stat.S_ISREG(
+                staged_identity.mode
+            ):
+                failure = failure or _TransactionConflict(
+                    "临时产物在发布前消失或不再是普通文件"
                 )
-            except OSError:
-                rollback_failed = True
-        for final_path, backup_path in reversed(backed_up):
-            try:
-                _replace_file(backup_path, final_path)
-            except OSError:
-                rollback_failed = True
+                break
+            attempt = _attempt_observed_move(
+                staged_path, final_path, staged_identity
+            )
+            if attempt.moved:
+                published.append((final_path, staged_identity))
+            if attempt.error is not None:
+                failure = attempt.error
+                break
 
-        if rollback_failed:
-            _write_recovery_guide(staging_dir)
-            raise _RecoveryRequired(
-                "视频与元数据发布失败，自动回滚也未完成。"
-                f"可恢复资料已保留在：{staging_dir}。"
-                "请暂停重试并查看其中的 RECOVERY.txt。"
-            ) from None
-        raise FetchError(
-            "视频与元数据发布失败，旧文件已恢复。"
-            "请检查输出目录权限和磁盘空间后重试。"
+    if failure is None:
+        return
+
+    if not _rollback_transaction(
+        published, backed_up, initial_states, staging_dir
+    ):
+        try:
+            guide_written = _write_recovery_guide(staging_dir, label)
+        except BaseException:
+            # 无论说明文件写入遇到什么中断，都先确保唯一备份不被
+            # 外层 finally 清理。后续统一通过 RecoveryRequired 报告路径。
+            guide_written = False
+        if guide_written:
+            recovery_action = "请暂停重试并查看其中的 RECOVERY.txt。"
+        else:
+            recovery_action = (
+                "恢复说明写入失败；请暂停重试，直接检查 "
+                "backups/ 和 failed-new/ 与最终槽位。"
+            )
+        raise _RecoveryRequired(
+            f"{label}发布失败，自动回滚也未完成。"
+            f"可恢复资料已保留在：{staging_dir}。"
+            f"{recovery_action}"
         ) from None
+
+    if isinstance(failure, (KeyboardInterrupt, SystemExit)):
+        raise failure
+    if not isinstance(failure, Exception):
+        raise failure
+    restored = (
+        "旧文件已恢复，原输出状态已恢复"
+        if any(identity is not None for identity in initial_states.values())
+        else "原输出状态已恢复"
+    )
+    raise FetchError(
+        f"{label}发布失败，{restored}。"
+        "请检查输出目录权限和磁盘空间后重试。"
+    ) from None
+
+
+def _cleanup_staging(staging_dir: Path) -> None:
+    """先清除可能含旧数据的 backups，失败时明确告知残留路径。"""
+    def warn() -> None:
+        print(
+            f"警告：临时目录清理失败，残留路径：{staging_dir}。"
+            "请确认最终产物后手动删除该目录。",
+            file=sys.stderr,
+        )
+
+    backups_dir = staging_dir / "backups"
+    try:
+        if _entry_identity(backups_dir) is not None:
+            shutil.rmtree(backups_dir)
+    except OSError:
+        # 不再整体删除 staging，避免在 backups 部分清理后
+        # 又遇故障时把仅存的旧数据状态进一步模糊化。
+        warn()
+        return
+    try:
+        shutil.rmtree(staging_dir)
+    except FileNotFoundError:
+        pass
+    except OSError:
+        warn()
 
 
 def _clean_subtitle_file(path: Path) -> None:
@@ -525,7 +737,7 @@ def _download_media(
         if metadata_path is not None
         else (final_path,)
     )
-    _preflight_slots(final_slots)
+    initial_states = _capture_slot_states(final_slots)
 
     staging_dir = _new_staging_dir(destination)
     keep_staging = False
@@ -535,45 +747,35 @@ def _download_media(
         options = build_opts(mode, quality, new_dir)
         info = _extract_info(factory, options, url, download=True)
         downloaded_path = new_dir / filename
-        if not downloaded_path.is_file():
-            raise FetchError(
-                f"下载已结束，但没有生成 {filename}。"
-                "请更新 yt-dlp 与 ffmpeg 后重试。"
-            )
+        _require_staged_regular(downloaded_path, filename)
 
         if mode == "video":
             temporary_metadata = new_dir / "meta.json"
             write_metadata(info, url, temporary_metadata)
-            _publish_video_pair(
-                downloaded_path,
-                temporary_metadata,
-                final_path,
-                metadata_path,
+            _require_staged_regular(temporary_metadata, "meta.json")
+            _publish_transaction(
+                (
+                    (downloaded_path, final_path),
+                    (temporary_metadata, metadata_path),
+                ),
+                initial_states,
                 staging_dir,
+                "视频与元数据",
             )
         else:
-            _preflight_slot(final_path)
-            try:
-                _replace_file(downloaded_path, final_path)
-            except OSError:
-                raise FetchError(
-                    "音频发布失败，原文件未改动。"
-                    "请检查输出目录权限和磁盘空间后重试。"
-                ) from None
+            _publish_transaction(
+                ((downloaded_path, final_path),),
+                initial_states,
+                staging_dir,
+                "音频",
+            )
         return final_path, metadata_path
     except _RecoveryRequired:
         keep_staging = True
         raise
     finally:
         if not keep_staging:
-            try:
-                shutil.rmtree(staging_dir)
-            except FileNotFoundError:
-                pass
-            except OSError:
-                # 最终槽位不受清理失败影响；下次 preflight 也不会
-                # 把 .fetch-* 误当成成品。
-                pass
+            _cleanup_staging(staging_dir)
 
 
 def _download_subtitles(
@@ -584,8 +786,9 @@ def _download_subtitles(
 ) -> tuple[Path, str, str]:
     destination = _make_output_dir(out_dir)
     final_path = destination / "subs.orig.srt"
-    _preflight_slot(final_path)
+    initial_states = _capture_slot_states((final_path,))
     staging_dir = _new_staging_dir(destination)
+    keep_staging = False
     try:
         new_dir = staging_dir
         options = build_opts("subs", None, new_dir)
@@ -613,33 +816,35 @@ def _download_subtitles(
             )
             downloader.process_ie_result(info, download=True)
 
-        candidates = sorted(
-            path
-            for path in new_dir.rglob("*.srt")
-            if path.is_file() and not path.is_symlink()
-        )
+        candidates = []
+        for path in new_dir.rglob("*.srt"):
+            try:
+                identity = _entry_identity(path)
+            except OSError:
+                continue
+            if identity is not None and stat.S_ISREG(identity.mode):
+                candidates.append(path)
+        candidates.sort()
         if len(candidates) != 1:
             raise FetchError(
                 "字幕下载已结束，但没有生成唯一的 SRT 文件。"
                 "请更新 yt-dlp 与 ffmpeg 后重试。"
             )
+        _require_staged_regular(candidates[0], candidates[0].name)
         _clean_subtitle_file(candidates[0])
-        _preflight_slot(final_path)
-        try:
-            _replace_file(candidates[0], final_path)
-        except OSError:
-            raise FetchError(
-                "字幕发布失败，原文件未改动。"
-                "请检查输出目录权限和磁盘空间后重试。"
-            ) from None
+        _publish_transaction(
+            ((candidates[0], final_path),),
+            initial_states,
+            staging_dir,
+            "字幕",
+        )
         return final_path, selected_language, source
+    except _RecoveryRequired:
+        keep_staging = True
+        raise
     finally:
-        try:
-            shutil.rmtree(staging_dir)
-        except FileNotFoundError:
-            pass
-        except OSError:
-            pass
+        if not keep_staging:
+            _cleanup_staging(staging_dir)
 
 
 def _quality(value: str) -> str:

@@ -58,7 +58,9 @@ def sanitize_filename(name: str) -> str:
         if char not in _WINDOWS_ILLEGAL_CHARS
         and unicodedata.category(char) != "Cc"
     )
-    return " ".join(cleaned.split())[:80]
+    # Windows 会忽略文件名尾部的点和空格，不先清理会导致
+    # 路径判断与真实目录名不一致。截断后再清一次避免第 80 位是点。
+    return " ".join(cleaned.split()).rstrip(" .")[:80].rstrip(" .")
 
 
 def item_dir(config: dict, title: str, date_str: str) -> Path:
@@ -139,16 +141,41 @@ def main(argv: Sequence[str] | None = None) -> int:
         payload = _prepare_payload(args.title, args.date)
     except SystemExit:
         raise
-    except (KeyError, TypeError, ValueError, OSError) as error:
-        detail = str(error) or "未知路径错误"
+    except (KeyError, TypeError, ValueError, OSError, UnicodeError):
         print(
-            f"无法准备素材目录：{detail}。"
-            "请检查 config.json 的六项配置和输出目录权限。",
+            "无法准备素材目录。"
+            "请检查标题、config.json 的六项配置和输出目录权限。",
             file=sys.stderr,
         )
         return 1
 
-    print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+    try:
+        encoded = (
+            json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n"
+        ).encode("utf-8")
+    except (TypeError, ValueError, UnicodeError):
+        print(
+            "无法输出配置 JSON：配置值包含无法编码的字符。"
+            "请修正 config.json 后重试。",
+            file=sys.stderr,
+        )
+        return 1
+
+    try:
+        buffer = getattr(sys.stdout, "buffer", None)
+        if buffer is None:
+            sys.stdout.write(encoded.decode("utf-8"))
+            sys.stdout.flush()
+        else:
+            buffer.write(encoded)
+            buffer.flush()
+    except (OSError, UnicodeError):
+        print(
+            "无法输出配置 JSON：终端输出失败。"
+            "请检查终端后重试。",
+            file=sys.stderr,
+        )
+        return 1
     return 0
 
 

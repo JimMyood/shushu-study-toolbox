@@ -12,7 +12,7 @@
 - 只根据已经读取的网页、字幕、文档或 `meta.json` 写作。
 - 优先读取通过校验的 `subs.bi.srt`，否则读取 `subs.orig.srt`。
 - 以下代码块以 Bash/zsh 展示；PowerShell 请用实际值替换变量后逐条运行。
-- 从 `config.json` 读取 `native_lang`；正文以该语言为主。
+- 复用本次 `common.py prepare` JSON 的 `item_dir` 与 `native_lang`；正文以该语言为主。
 - 关键术语使用「母语译名 (English Term)」双语对照。
 - 诚实不画饼；素材没有支持的事实不补写、不猜测。
 - 不把常识、个人推断或宣传语伪装成原素材的结论。
@@ -21,21 +21,23 @@
 
 ## 步骤
 
-1. 设置素材目录，并查看当前母语配置：
+1. 流水线中复用已解析的 prepare JSON，将 `item_dir` 和 `native_lang`
+   记为 `ITEM_DIR` 与 `NATIVE_LANG`。只有独立启动、尚未 prepare 时才运行：
 
 ```bash
-ITEM_DIR="$HOME/ShushuStudy/2026-07-15-example"
-python3 -c 'import sys; sys.path.insert(0,"scripts"); from common import load_config; print(load_config()["native_lang"])'
+TITLE='素材的真实标题'
+python scripts/common.py prepare --title "$TITLE"
 ```
 
-- exit 0：使用打印出的 `native_lang` 写正文。
+- exit 0：复用返回的同一 `ITEM_DIR`，使用 `NATIVE_LANG` 写正文。
 - exit 1：配置无法读取；修复 `config.json` 后再写，不自行假定语言。
+- 只有用户明确要求本次临时覆盖时，才不用配置中的母语。
 
 2. 读取现有来源信息和字幕，不只看标题就开始总结：
 
 ```bash
-python3 -m json.tool "$ITEM_DIR/meta.json"
-python3 scripts/srt_tools.py validate "$ITEM_DIR/subs.bi.srt"
+python -m json.tool "$ITEM_DIR/meta.json"
+python scripts/srt_tools.py validate "$ITEM_DIR/subs.bi.srt"
 ```
 
 - `meta.json` 不存在时，从原始来源记录标题、链接、时长/字数和日期。
@@ -94,7 +96,7 @@ python3 scripts/srt_tools.py validate "$ITEM_DIR/subs.bi.srt"
 5. 完稿后检查固定标题完整且文件非空：
 
 ```bash
-python3 -c 'from pathlib import Path; import sys; p=Path(sys.argv[1]); t=p.read_text(encoding="utf-8"); hs=["## 一句话核心","## 适合谁看","## 核心要点","## 核心概念","## 常见误区","## 学以致用","## 原文金句"]; missing=[h for h in hs if h not in t]; print("缺失:"+",".join(missing) if missing else "结构检查通过"); raise SystemExit(bool(missing) or not t.strip())' "$ITEM_DIR/notes.md"
+python -c 'from pathlib import Path; import sys; p=Path(sys.argv[1]); t=p.read_text(encoding="utf-8"); hs=["## 一句话核心","## 适合谁看","## 核心要点","## 核心概念","## 常见误区","## 学以致用","## 原文金句"]; missing=[h for h in hs if h not in t]; print("缺失:"+",".join(missing) if missing else "结构检查通过"); raise SystemExit(bool(missing) or not t.strip())' "$ITEM_DIR/notes.md"
 ```
 
 - exit 0：固定结构齐全；继续人工检查字数、条数与事实依据。

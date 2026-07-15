@@ -116,7 +116,7 @@ mklink /D "%USERPROFILE%\.claude\skills\shushu-study-toolbox" "%CD%"
 | --- | --- |
 | 树树工具箱 - 下载素材 | “把这个公开视频下载到我的学习目录，最高 1080p，只供个人学习：`https://example.com/video`。” |
 | 树树工具箱 - 获取字幕 | “先获取这条视频的英文来源字幕；如果没有，估算本地转写时间并问我是否继续。” |
-| 树树工具箱 - 翻译字幕 | “把 `$HOME/ShushuStudy/example/subs.orig.srt` 翻成原文在上的中英双语字幕，支持中断续跑。” |
+| 树树工具箱 - 翻译字幕 | “把本次 `ITEM_DIR` 中的 `subs.orig.srt` 翻成配置布局的双语字幕，支持中断续跑。” |
 | 树树工具箱 - 视频嵌字幕 | “把 `video.mp4` 和 `subs.bi.srt` 软封装为可开关字幕的视频，不要覆盖源文件。” |
 | 树树工具箱 - 生成学习笔记 | “根据这个目录中已校验的双语字幕生成一篇中文为主、关键术语保留英文的学习笔记。” |
 | 树树工具箱 - 精读网页与 PDF | “精读这份 PDF；我要双语摘要，不要全文翻译，并给可核对的引文页码。” |
@@ -124,11 +124,16 @@ mklink /D "%USERPROFILE%\.claude\skills\shushu-study-toolbox" "%CD%"
 也可以直接运行机械脚本；真实参数以各工具手册和 `python scripts/<脚本>.py --help` 为准。例如：
 
 ```bash
-python scripts/fetch.py video "https://example.com/video" --quality 1080 --out "$HOME/ShushuStudy/example"
-python scripts/fetch.py subs "https://example.com/video" --lang en --out "$HOME/ShushuStudy/example"
-python scripts/srt_tools.py validate "$HOME/ShushuStudy/example/subs.orig.srt"
-python scripts/mux.py soft "$HOME/ShushuStudy/example/video.mp4" "$HOME/ShushuStudy/example/subs.bi.srt" --out "$HOME/ShushuStudy/example/video.soft.mp4"
+TITLE='素材的真实标题'
+python scripts/common.py prepare --title "$TITLE"
+# 解析上一行 JSON，得到 ITEM_DIR、VIDEO_QUALITY、SOURCE_LANG 等真实配置值
+python scripts/fetch.py video "https://example.com/video" --quality "$VIDEO_QUALITY" --out "$ITEM_DIR"
+python scripts/fetch.py subs "https://example.com/video" --lang "$SOURCE_LANG" --out "$ITEM_DIR"
+python scripts/srt_tools.py validate "$ITEM_DIR/subs.orig.srt"
+python scripts/mux.py soft "$ITEM_DIR/video.mp4" "$ITEM_DIR/subs.bi.srt" --out "$ITEM_DIR/video.soft.mp4"
 ```
+
+同一流水线只运行一次 `prepare`，后续步骤复用同一个 `ITEM_DIR`。
 
 ## FAQ
 
