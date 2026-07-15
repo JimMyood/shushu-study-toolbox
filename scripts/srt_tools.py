@@ -37,10 +37,12 @@ class StaleIsolationError(Exception):
         self,
         *,
         reason: str,
+        partial_state: bool = False,
         recovery_dir: Path | None = None,
     ):
         super().__init__()
         self.reason = reason
+        self.partial_state = partial_state
         self.recovery_dir = recovery_dir
 
 
@@ -368,6 +370,7 @@ def _link_unique_stale(
 def _rollback_isolations(
     records: list[dict[str, object]], archive_dir: Path
 ) -> tuple[bool, Path]:
+    partial_state = False
 
     for record in records:
         source = record["source"]
@@ -387,11 +390,14 @@ def _rollback_isolations(
                     os.link(carrier, source, follow_symlinks=False)
                 except OSError as error:
                     if error.errno != errno.EEXIST:
+                        partial_state = True
                         break
                 break
             current_identity = _try_entry_identity(source)
         restored = current_identity == expected
         record["restored"] = restored
+        if not restored:
+            partial_state = True
 
     for record in reversed(records):
         source = record["source"]
@@ -405,16 +411,21 @@ def _rollback_isolations(
         )
         stale_identity = _try_entry_identity(stale_path)
         if stale_identity is None:
+            partial_state = True
             continue
         if not restored and stale_identity == expected:
+            partial_state = True
             continue
         try:
             parked_path, parked_identity = _park_entry(
                 stale_path, archive_dir
             )
         except OSError:
+            partial_state = True
             continue
         record["parks"].append((parked_path, parked_identity))
+        if parked_identity != expected:
+            partial_state = True
 
     for record in records:
         source = record["source"]
@@ -422,11 +433,13 @@ def _rollback_isolations(
         assert isinstance(source, Path) and isinstance(expected, tuple)
         restored = _try_entry_identity(source) == expected
         record["restored"] = restored
+        if not restored:
+            partial_state = True
 
     # 可移植文件 API 没有“仅当另一路径仍指向同一 inode 时才删除”的
     # compare-and-unlink。因此回滚不自动删除已建立的私有载体；它可能
     # 是旧译文，也可能是并发变化后被保留的目录项，失败时必须人工核对。
-    return True, archive_dir
+    return partial_state, archive_dir
 
 
 def _isolate_regular_entries(
@@ -523,6 +536,7 @@ def _isolate_regular_entries(
             if preserve_archive and archive_dir is not None:
                 raise StaleIsolationError(
                     reason=reason,
+                    partial_state=True,
                     recovery_dir=archive_dir,
                 ) from error
             try:
@@ -533,10 +547,16 @@ def _isolate_regular_entries(
             except OSError:
                 partial_state = True
                 remaining_recovery = archive_dir
+            partial_state = partial_state or reason in {
+                "source_changed",
+                "stale_changed",
+                "recovery_changed",
+            }
             if partial_state and reason == "operation":
                 reason = "rollback_changed"
             raise StaleIsolationError(
                 reason=reason,
+                partial_state=partial_state,
                 recovery_dir=remaining_recovery,
             ) from error
         raise StaleIsolationError(reason=reason) from error
@@ -577,9 +597,7 @@ def _isolate_legacy_translations(out_dir: Path) -> None:
         )
     except StaleIsolationError as error:
         raise LegacyIsolationError(
-            partial_state=error.recovery_dir is not None
-            or error.reason
-            in {"source_changed", "stale_changed", "rollback_changed"},
+            partial_state=error.partial_state,
             recovery_dir=error.recovery_dir,
             unsafe_entry=error.reason == "unsafe",
         ) from error
@@ -636,6 +654,15 @@ def chunk_subtitles(input_path: Path, size: int, out_dir: Path) -> int:
                         "旧版译文只完成了部分隔离，清单与源分块尚未更新；"
                         f"{recovery_message}请手动恢复后重试。"
                         "原译文不会被自动复用",
+                        file=sys.stderr,
+                    )
+                elif error.recovery_dir is not None:
+                    print(
+                        f"无法隔离旧版译文：{out_dir}。"
+                        "回滚一致点已确认旧版 .zh.txt 完整恢复，"
+                        "清单与源分块未更新；"
+                        f"安全归档保留供核对：{error.recovery_dir}。"
+                        "请勿自动删除，修复问题后重试",
                         file=sys.stderr,
                     )
                 else:

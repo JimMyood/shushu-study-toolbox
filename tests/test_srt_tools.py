@@ -1105,7 +1105,92 @@ def test_chunk_legacy_isolation_failure_preserves_old_translation(
     assert not (chunks_dir / "chunk_000.translated.txt").exists()
 
 
-def test_chunk_second_legacy_isolation_failure_rolls_back_every_entry(
+def test_legacy_second_link_failure_keeps_archive_separate_from_partial_state(
+    tmp_path, monkeypatch
+):
+    srt_tools = _load_srt_tools()
+    chunks_dir = _chunk_sample(tmp_path)
+    _write_translations(chunks_dir)
+    manifest = _convert_to_legacy_manifest(chunks_dir)
+    legacy_before = {
+        chunks_dir / chunk["translation_file"]: (
+            chunks_dir / chunk["translation_file"]
+        ).read_bytes()
+        for chunk in manifest["chunks"]
+    }
+    second_legacy = chunks_dir / "chunk_001.zh.txt"
+    real_link = os.link
+
+    def fail_second_isolation(source, target, *args, **kwargs):
+        if Path(source) == second_legacy and "stale-legacy" in Path(target).name:
+            raise OSError(errno.EIO, "secret second isolation failure")
+        return real_link(source, target, *args, **kwargs)
+
+    monkeypatch.setattr(os, "link", fail_second_isolation)
+
+    with pytest.raises(srt_tools.LegacyIsolationError) as raised:
+        srt_tools._isolate_legacy_translations(chunks_dir)
+
+    error = raised.value
+    assert error.partial_state is False
+    assert error.recovery_dir is not None
+    assert error.recovery_dir.is_dir()
+    assert {
+        path: path.read_bytes() for path in legacy_before
+    } == legacy_before
+    assert not list(chunks_dir.glob("chunk_*.stale-legacy*.txt"))
+    assert next(iter(legacy_before.values())) in _regular_file_payloads(
+        error.recovery_dir
+    )
+
+
+def test_legacy_rollback_marks_disappeared_public_stale_as_partial(
+    tmp_path, monkeypatch
+):
+    srt_tools = _load_srt_tools()
+    chunks_dir = _chunk_sample(tmp_path)
+    _write_translations(chunks_dir)
+    manifest = _convert_to_legacy_manifest(chunks_dir)
+    legacy_before = {
+        chunks_dir / chunk["translation_file"]: (
+            chunks_dir / chunk["translation_file"]
+        ).read_bytes()
+        for chunk in manifest["chunks"]
+    }
+    first_stale = chunks_dir / "chunk_000.stale-legacy.txt"
+    second_legacy = chunks_dir / "chunk_001.zh.txt"
+    real_replace = os.replace
+    injected = {"done": False}
+
+    def fail_second_park_after_removing_stale(source, target, *args, **kwargs):
+        source = Path(source)
+        target = Path(target)
+        if (
+            source == second_legacy
+            and target.parent.name.startswith(".srt-safety-archive-")
+            and not injected["done"]
+        ):
+            first_stale.unlink()
+            injected["done"] = True
+            raise OSError(errno.EIO, "secret second park failure")
+        return real_replace(source, target, *args, **kwargs)
+
+    monkeypatch.setattr(os, "replace", fail_second_park_after_removing_stale)
+
+    with pytest.raises(srt_tools.LegacyIsolationError) as raised:
+        srt_tools._isolate_legacy_translations(chunks_dir)
+
+    error = raised.value
+    assert injected["done"] is True
+    assert error.partial_state is True
+    assert error.recovery_dir is not None
+    assert {
+        path: path.read_bytes() for path in legacy_before
+    } == legacy_before
+    assert not first_stale.exists()
+
+
+def test_chunk_second_legacy_isolation_failure_reports_complete_rollback(
     tmp_path, monkeypatch, capsys
 ):
     srt_tools = _load_srt_tools()
@@ -1140,8 +1225,10 @@ def test_chunk_second_legacy_isolation_failure_rolls_back_every_entry(
 
     captured = capsys.readouterr()
     assert exit_code == 1
-    assert "旧版译文只完成了部分隔离" in captured.err
-    assert "安全归档" in captured.err
+    assert "无法隔离旧版译文" in captured.err
+    assert "回滚一致点已确认旧版 .zh.txt 完整恢复" in captured.err
+    assert "安全归档保留供核对" in captured.err
+    assert "只完成了部分隔离" not in captured.err
     assert "secret" not in captured.err
     assert manifest_path.read_bytes() == manifest_before
     assert {
@@ -1288,7 +1375,7 @@ def test_chunk_legacy_rollback_race_preserves_competitor_and_recovery(
     assert not list(chunks_dir.glob("chunk_*.translated.txt"))
 
 
-def test_chunk_legacy_rollback_source_swap_after_validation_keeps_recovery(
+def test_chunk_legacy_source_swap_after_rollback_consistency_point_keeps_archive(
     tmp_path, monkeypatch, capsys
 ):
     srt_tools = _load_srt_tools()
@@ -1345,7 +1432,8 @@ def test_chunk_legacy_rollback_source_swap_after_validation_keeps_recovery(
     assert len(archives) == 1
     assert old_translation in _regular_file_payloads(archives[0])
     assert str(archives[0]) in captured.err
-    assert "旧版译文只完成了部分隔离" in captured.err
+    assert "回滚一致点已确认旧版 .zh.txt 完整恢复" in captured.err
+    assert "只完成了部分隔离" not in captured.err
     assert manifest_path.read_bytes() == manifest_before
     assert {
         path: path.read_bytes() for path in source_before
