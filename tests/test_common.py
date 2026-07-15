@@ -61,6 +61,56 @@ def test_sanitize_prefixes_windows_reserved_device_names(raw, expected):
 
 
 @pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("COM¹", "_COM¹"),
+        ("com².txt", "_com².txt"),
+        ("CoM³.notes.md", "_CoM³.notes.md"),
+        ("LPT¹", "_LPT¹"),
+        ("lpt².log", "_lpt².log"),
+        ("LpT³.anything", "_LpT³.anything"),
+    ],
+)
+def test_sanitize_prefixes_superscript_windows_device_names(raw, expected):
+    assert common.sanitize_filename(raw) == expected
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("COM¹." + "x" * 75, "_COM¹." + "x" * 74),
+        (
+            "lpt³." + "x" * 71 + ".txt",
+            "_lpt³." + "x" * 70 + ".txt",
+        ),
+    ],
+)
+def test_sanitize_superscript_device_name_obeys_80_character_limit(
+    raw, expected
+):
+    assert len(raw) == 80
+    sanitized = common.sanitize_filename(raw)
+    assert sanitized == expected
+    assert len(sanitized) <= 80
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "COM⁰.txt",
+        "COM⁴.txt",
+        "LPT⁰.log",
+        "LPT⁴.log",
+        "COM¹⁰.txt",
+        "myCOM¹.txt",
+        "LPT³ backup",
+    ],
+)
+def test_sanitize_does_not_change_non_reserved_superscript_names(name):
+    assert common.sanitize_filename(name) == name
+
+
+@pytest.mark.parametrize(
     "name",
     [
         "CON lesson",
