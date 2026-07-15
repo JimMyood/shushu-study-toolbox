@@ -16,6 +16,7 @@
 - 先问用户选择软字幕还是硬字幕，不替用户决定最终观看方式。
 - 软字幕可开关、处理快；播放器必须支持 MP4 的 mov_text 字幕流。
 - 硬字幕不可关闭、需重编码，耗时约与视频时长相当。
+- 硬字幕会自动选择当前系统中存在且可读的常见中文字体，并打印名称与路径。
 - 输出文件必须与输入视频和字幕不同名，避免覆盖源文件。
 
 ## 步骤
@@ -58,10 +59,19 @@ python3 scripts/mux.py soft "$VIDEO" "$SUBTITLE" --out "$ITEM_DIR/video.soft.mp4
 python3 scripts/mux.py burn "$VIDEO" "$SUBTITLE" --out "$ITEM_DIR/video.burn.mp4"
 ```
 
+- 默认字体不合适时，可显式覆盖已安装的中文字体：
+
+```bash
+python3 scripts/mux.py burn "$VIDEO" "$SUBTITLE" --font "Noto Sans CJK SC" --out "$ITEM_DIR/video.burn.mp4"
+```
+
+- `--font` 必须是系统能精确匹配、当前用户可读且含中文字形的字体；名称不能包含逗号、等号或引号。
+
 6. 硬字幕命令的分支处理：
 
 - exit 0：报告 `video.burn.mp4`；抽查画面确认字幕确实可见。
-- exit 1：检查视频、UTF-8 SRT、ffmpeg 与 subtitles/libass 滤镜。
+- exit 1：检查视频、UTF-8 SRT、ffmpeg、subtitles/libass 滤镜和屏幕字体提示。
+- 报告没有可读中文字体时，安装提示中的字体，或用 `--font` 指定另一款已安装字体。
 - exit 2：参数错误；核对顺序为 `burn VIDEO SUBTITLE --out OUTPUT`。
 - 其他 exit code：停止并报告，不声称重编码完成。
 
@@ -98,6 +108,7 @@ ffprobe -v error -select_streams s -show_entries stream=codec_name -of default=n
 - `未找到 ffmpeg`：按 doctor 的当前平台修复指引安装或启用静态兜底。
 - `未找到 ffprobe`：需要带 ffprobe 的完整 ffmpeg 安装。
 - 软字幕看不见：先在播放器中开启字幕轨；必要时换支持 mov_text 的播放器。
-- 硬烧录失败：确认 ffmpeg 构建包含 subtitles/libass 滤镜且 SRT 为 UTF-8。
+- 硬烧录失败：确认 ffmpeg 含 subtitles/libass、SRT 为 UTF-8，并查看自动选择的字体。
+- 中文显示方框：用 `--font "Arial Unicode MS"`、`Microsoft YaHei` 或 `Noto Sans CJK SC` 重试；工具会拒绝不存在、不可读或缺少中文字形的名称，并在 ffmpeg 报告缺字时停止发布输出。
 - 路径含空格或特殊字符：始终保留命令中的双引号，脚本会继续转义滤镜路径。
 - 输出与输入同名：换独立输出名；工具会拒绝覆盖输入文件。

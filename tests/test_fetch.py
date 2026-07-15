@@ -508,11 +508,17 @@ def test_cli_subs_removes_blank_cues_before_atomic_publish(
     assert "Traceback" not in captured.out + captured.err
 
 
-def test_cli_subs_rejects_all_blank_cues_without_publishing(
+def test_cli_subs_rejects_all_blank_cues_preserves_existing_and_cleans_temp(
     tmp_path, capsys
 ):
     fetch = _fetch_module()
     output_dir = tmp_path / "out"
+    output_dir.mkdir()
+    subtitle_path = output_dir / "subs.orig.srt"
+    previous_subtitle = (
+        b"1\n00:00:00,000 --> 00:00:01,000\nExisting subtitle\n"
+    )
+    subtitle_path.write_bytes(previous_subtitle)
     factory, _state = _fake_ydl(
         {"subtitles": {"en": [{"ext": "srt"}]}},
         subtitle_text=(
@@ -538,7 +544,9 @@ def test_cli_subs_rejects_all_blank_cues_without_publishing(
     assert "字幕内容为空" in captured.err
     assert "请" in captured.err
     assert "Traceback" not in captured.out + captured.err
-    assert not (output_dir / "subs.orig.srt").exists()
+    assert subtitle_path.read_bytes() == previous_subtitle
+    assert list(output_dir.glob(".fetch-*")) == []
+    assert set(output_dir.iterdir()) == {subtitle_path}
 
 
 def test_cli_subs_uses_automatic_caption_only_after_official_miss(

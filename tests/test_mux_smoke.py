@@ -103,9 +103,19 @@ def test_burn_uses_subtitles_filter_and_warns_before_ffmpeg(
     mux = _load_mux()
     video, subtitle = _inputs(tmp_path)
     output = tmp_path / "burned.mp4"
+    font_dir = tmp_path / "CJK fonts,[safe]'"
+    font_dir.mkdir()
+    font_file = font_dir / "Arial Unicode.ttf"
+    font_file.write_bytes(b"readable font")
     state = {}
     monkeypatch.setattr(
         mux, "find_ffmpeg", lambda: ("/tools/ffmpeg", "system")
+    )
+    monkeypatch.setattr(
+        mux,
+        "_select_burn_font",
+        lambda _font: ("Arial Unicode MS", font_file),
+        raising=False,
     )
 
     def fake_run(command, **kwargs):
@@ -120,10 +130,20 @@ def test_burn_uses_subtitles_filter_and_warns_before_ffmpeg(
     mux.burn(video, subtitle, output)
 
     assert "需重编码，耗时约与视频时长相当" in state["before_run"]
+    assert "自动选择硬字幕字体：Arial Unicode MS" in state["before_run"]
     command = state["command"]
     assert isinstance(command, list)
-    assert command[command.index("-vf") + 1].startswith("subtitles=filename=")
-    assert "charenc=UTF-8" in command[command.index("-vf") + 1]
+    subtitle_filter = command[command.index("-vf") + 1]
+    assert subtitle_filter.startswith("subtitles=filename=")
+    assert "charenc=UTF-8" in subtitle_filter
+    assert (
+        f"fontsdir={mux._escape_subtitle_filter_path(font_dir)}"
+        in subtitle_filter
+    )
+    assert (
+        "force_style='FontName=Arial Unicode MS,FontSize=26,Outline=2'"
+        in subtitle_filter
+    )
     assert str(video) in command
     assert str(subtitle.resolve()) not in command
     assert state["kwargs"]["capture_output"] is True
@@ -142,6 +162,284 @@ def test_escape_subtitle_filter_path_handles_spaces_quote_colon_backslash():
     assert escaped == (
         r"C\\:\\\\Course Files\\\\Bob\\\'s\\: lesson\,\[1\]\;.srt"
     )
+
+
+@pytest.mark.parametrize(
+    "font_name",
+    ["Arial Unicode MS", "Microsoft YaHei", "Noto Sans CJK SC"],
+)
+def test_auto_burn_font_uses_first_readable_cross_platform_candidate(
+    tmp_path, monkeypatch, font_name
+):
+    mux = _load_mux()
+    missing = tmp_path / "missing.ttf"
+    readable = tmp_path / f"{font_name}.ttf"
+    readable.write_bytes(b"font")
+    monkeypatch.setattr(
+        mux,
+        "_font_candidates",
+        lambda: [("Missing CJK", missing), (font_name, readable)],
+        raising=False,
+    )
+    monkeypatch.setattr(shutil, "which", lambda _name: None)
+
+    selected = mux._select_burn_font(None)
+
+    assert selected == (font_name, readable)
+
+
+def test_explicit_burn_font_must_resolve_to_readable_exact_match(
+    tmp_path, monkeypatch
+):
+    mux = _load_mux()
+    readable = tmp_path / "Arial Unicode.ttf"
+    readable.write_bytes(b"font")
+    monkeypatch.setattr(
+        mux,
+        "_font_candidates",
+        lambda: [("Arial Unicode MS", readable)],
+        raising=False,
+    )
+    monkeypatch.setattr(shutil, "which", lambda _name: None)
+
+    assert mux._select_burn_font("Arial Unicode MS") == (
+        "Arial Unicode MS",
+        readable,
+    )
+    with pytest.raises(mux.MuxError) as error:
+        mux._select_burn_font("Ghost CJK")
+
+    message = str(error.value)
+    assert "Ghost CJK" in message
+    assert "找不到或无法读取" in message
+    assert "--font" in message
+
+
+def test_explicit_burn_font_uses_exact_fc_match_without_shell(
+    tmp_path, monkeypatch
+):
+    mux = _load_mux()
+    font_file = tmp_path / "Custom CJK.ttf"
+    font_file.write_bytes(b"font")
+    calls = []
+    monkeypatch.setattr(mux, "_font_candidates", lambda: [], raising=False)
+    monkeypatch.setattr(
+        shutil,
+        "which",
+        lambda name: "/tools/fc-match" if name == "fc-match" else None,
+    )
+
+    def fake_run(command, **kwargs):
+        calls.append((command, kwargs))
+        return _completed(
+            command,
+            stdout=f"Custom CJK\t{font_file}\n",
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    selected = mux._select_burn_font("Custom CJK")
+
+    assert selected == ("Custom CJK", font_file)
+    command, kwargs = calls[0]
+    assert command == [
+        "/tools/fc-match",
+        "--format",
+        "%{family}\t%{file}\n",
+        "Custom CJK:charset=4e2d",
+    ]
+    assert kwargs["capture_output"] is True
+    assert kwargs["text"] is True
+    assert kwargs["encoding"] == "utf-8"
+    assert kwargs.get("shell") is not True
+    assert Path(kwargs["env"]["XDG_CACHE_HOME"]).name.startswith(
+        ".mux-font-cache-"
+    )
+
+
+def test_explicit_font_without_cjk_glyph_is_rejected(
+    tmp_path, monkeypatch
+):
+    mux = _load_mux()
+    fallback_file = tmp_path / "Fallback CJK.ttf"
+    fallback_file.write_bytes(b"font")
+    monkeypatch.setattr(mux, "_font_candidates", lambda: [], raising=False)
+    monkeypatch.setattr(
+        shutil,
+        "which",
+        lambda name: "/tools/fc-match" if name == "fc-match" else None,
+    )
+
+    def fake_run(command, **_kwargs):
+        return _completed(
+            command,
+            stdout=f"Fallback CJK\t{fallback_file}\n",
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    with pytest.raises(mux.MuxError) as error:
+        mux._select_burn_font("Latin Sans")
+
+    message = str(error.value)
+    assert "中文字形" in message
+    assert "--font" in message
+
+
+def test_burn_rejects_missing_glyph_warning_and_preserves_target(
+    tmp_path, monkeypatch, capsys
+):
+    mux = _load_mux()
+    video, subtitle = _inputs(tmp_path)
+    output = tmp_path / "existing.mp4"
+    output.write_bytes(b"old target")
+    font_file = tmp_path / "Arial Unicode.ttf"
+    font_file.write_bytes(b"font")
+    state = {}
+    monkeypatch.setattr(
+        mux,
+        "_select_burn_font",
+        lambda _font: ("Arial Unicode MS", font_file),
+    )
+    monkeypatch.setattr(
+        mux, "find_ffmpeg", lambda: ("/tools/ffmpeg", "system")
+    )
+
+    def fake_run(command, **_kwargs):
+        state["temporary"] = Path(command[-1])
+        state["temporary"].write_bytes(b"video with tofu")
+        return _completed(
+            command,
+            stderr=(
+                "fontselect: failed to find any fallback with glyph 0x4E2D"
+            ),
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    exit_code = mux.main(
+        [
+            "burn",
+            str(video),
+            str(subtitle),
+            "--out",
+            str(output),
+        ]
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert "字体无法显示部分中文" in captured.err
+    assert "--font" in captured.err
+    assert "Traceback" not in captured.out + captured.err
+    assert output.read_bytes() == b"old target"
+    assert not state["temporary"].exists()
+    assert set(tmp_path.iterdir()) == {
+        video,
+        subtitle,
+        output,
+        font_file,
+    }
+
+
+def test_burn_cli_accepts_explicit_font_override(
+    tmp_path, monkeypatch, capsys
+):
+    mux = _load_mux()
+    video, subtitle = _inputs(tmp_path)
+    output = tmp_path / "custom-font.mp4"
+    font_file = tmp_path / "NotoSansCJK-Regular.ttc"
+    font_file.write_bytes(b"font")
+    monkeypatch.setattr(
+        mux,
+        "_font_candidates",
+        lambda: [("Noto Sans CJK SC", font_file)],
+        raising=False,
+    )
+    monkeypatch.setattr(shutil, "which", lambda _name: None)
+    monkeypatch.setattr(
+        mux, "find_ffmpeg", lambda: ("/tools/ffmpeg", "system")
+    )
+
+    def fake_run(command, **_kwargs):
+        Path(command[-1]).write_bytes(b"burned video")
+        return _completed(command)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    exit_code = mux.main(
+        [
+            "burn",
+            str(video),
+            str(subtitle),
+            "--font",
+            "Noto Sans CJK SC",
+            "--out",
+            str(output),
+        ]
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert "使用指定硬字幕字体：Noto Sans CJK SC" in captured.out
+    assert output.read_bytes() == b"burned video"
+
+
+def test_burn_cli_rejects_unsafe_font_name_without_traceback(
+    tmp_path, capsys
+):
+    mux = _load_mux()
+    video, subtitle = _inputs(tmp_path)
+
+    with pytest.raises(SystemExit) as error:
+        mux.main(
+            [
+                "burn",
+                str(video),
+                str(subtitle),
+                "--font",
+                "Arial,Outline=0",
+                "--out",
+                str(tmp_path / "out.mp4"),
+            ]
+        )
+
+    captured = capsys.readouterr()
+    assert error.value.code == 2
+    assert "字体名称" in captured.err
+    assert "逗号" in captured.err
+    assert "Traceback" not in captured.out + captured.err
+
+
+def test_auto_burn_font_failure_is_human_and_stops_before_ffmpeg(
+    tmp_path, monkeypatch, capsys
+):
+    mux = _load_mux()
+    video, subtitle = _inputs(tmp_path)
+    monkeypatch.setattr(mux, "_font_candidates", lambda: [], raising=False)
+    monkeypatch.setattr(shutil, "which", lambda _name: None)
+    monkeypatch.setattr(
+        mux,
+        "find_ffmpeg",
+        lambda: pytest.fail("没有可用中文字体时不应运行 ffmpeg"),
+    )
+
+    exit_code = mux.main(
+        [
+            "burn",
+            str(video),
+            str(subtitle),
+            "--out",
+            str(tmp_path / "out.mp4"),
+        ]
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert "未找到可读的中文字体" in captured.err
+    assert "--font" in captured.err
+    assert "Traceback" not in captured.out + captured.err
+    assert not (tmp_path / "out.mp4").exists()
 
 
 @pytest.mark.parametrize(
