@@ -118,6 +118,7 @@ jobs:
         shell: python
         run: |
           import os
+          import subprocess
           import sys
           from pathlib import Path
 
@@ -132,6 +133,15 @@ jobs:
           assert executable.is_file(), f"静态 ffmpeg 不存在：{executable}"
           assert os.access(executable, os.X_OK), (
               f"静态 ffmpeg 不可执行：{executable}"
+          )
+          version = subprocess.run(
+              [str(executable), "-version"],
+              check=True,
+              capture_output=True,
+              text=True,
+          )
+          assert "ffmpeg version" in version.stdout, (
+              "静态 ffmpeg 未返回有效版本信息"
           )
 
       - name: 运行全量测试
