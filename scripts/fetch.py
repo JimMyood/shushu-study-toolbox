@@ -465,8 +465,22 @@ class _EntryIdentity:
     mode: int
 
 
+@dataclass
+class _ParkState:
+    directory: Path
+    directory_identity: _EntryIdentity
+    known_identities: set[_EntryIdentity]
+    parked_paths: set[Path]
+    watched_sources: set[Path]
+    tainted_paths: set[Path]
+
+
 class _TransactionConflict(Exception):
     """发布槽位或文件身份在事务中发生了竞态变化。"""
+
+
+class _ParkedSourceConflict(_TransactionConflict):
+    """共享 source 在 link 后被换包，未知项已移入私有 parked。"""
 
 
 def _entry_identity(path: Path) -> _EntryIdentity | None:
@@ -546,17 +560,126 @@ def _link_file(source: Path, destination: Path) -> None:
     os.link(source, destination, follow_symlinks=False)
 
 
-def _unlink_file(path: Path) -> None:
-    """为事务测试提供可注入故障的 unlink 边界。"""
-    path.unlink()
+def _replace_source_with_parked(source: Path, parked: Path) -> None:
+    """只覆盖私有目录中本进程独占创建的 placeholder。"""
+    os.replace(source, parked)
+
+
+def _new_park_state(
+    staging_dir: Path,
+    known_identities: set[_EntryIdentity],
+) -> _ParkState:
+    parked_dir = staging_dir / "parked"
+    try:
+        parked_dir.mkdir(mode=0o700)
+        identity = _entry_identity(parked_dir)
+    except OSError:
+        identity = None
+    if (
+        identity is None
+        or not stat.S_ISDIR(identity.mode)
+        or (
+            os.name != "nt"
+            and stat.S_IMODE(identity.mode) != 0o700
+        )
+    ):
+        raise FetchError(
+            "无法创建仅当前用户可访问的 parked 临时区。"
+            "请检查输出目录权限后重试。"
+        )
+    return _ParkState(
+        directory=parked_dir,
+        directory_identity=identity,
+        known_identities=set(known_identities),
+        parked_paths=set(),
+        watched_sources=set(),
+        tainted_paths=set(),
+    )
+
+
+def _new_parked_placeholder(
+    state: _ParkState,
+) -> tuple[Path, _EntryIdentity]:
+    if _entry_identity(state.directory) != state.directory_identity:
+        raise _TransactionConflict("parked 私有目录身份已变化")
+
+    descriptor, raw_path = tempfile.mkstemp(
+        prefix=".entry-",
+        dir=state.directory,
+    )
+    placeholder = Path(raw_path)
+    try:
+        created = os.fstat(descriptor)
+        identity = _EntryIdentity(
+            created.st_dev,
+            created.st_ino,
+            created.st_mode,
+        )
+        if not stat.S_ISREG(identity.mode):
+            raise _TransactionConflict("parked placeholder 不是普通文件")
+        state.parked_paths.add(placeholder)
+        state.known_identities.add(identity)
+    finally:
+        os.close(descriptor)
+    return placeholder, identity
+
+
+def _find_unknown_transaction_entries(state: _ParkState) -> list[Path]:
+    """识别 parked 内容和曾用 source 路径上的未知 inode。"""
+    if _entry_identity(state.directory) != state.directory_identity:
+        raise _TransactionConflict("parked 私有目录身份已变化")
+    candidates = set(state.directory.iterdir())
+    candidates.update(state.parked_paths)
+    candidates.update(state.watched_sources)
+    unknown = []
+    for path in sorted(candidates, key=str):
+        identity = _entry_identity(path)
+        if identity is not None and identity not in state.known_identities:
+            unknown.append(path)
+    return unknown
+
+
+def _park_linked_source(
+    source: Path,
+    expected_source: _EntryIdentity,
+    state: _ParkState,
+) -> Path:
+    """原子搬走 link 后瞬间实际位于 source 的目录项。"""
+    state.watched_sources.add(source)
+    placeholder, placeholder_identity = _new_parked_placeholder(state)
+    if _entry_identity(placeholder) != placeholder_identity:
+        state.tainted_paths.add(placeholder)
+        raise _ParkedSourceConflict("parked placeholder 身份已变化")
+    _replace_source_with_parked(source, placeholder)
+
+    parked_identity = _entry_identity(placeholder)
+    source_after = _entry_identity(source)
+    unknown = []
+    if (
+        parked_identity is not None
+        and parked_identity not in state.known_identities
+    ):
+        unknown.append(placeholder)
+    if source_after is not None and source_after not in state.known_identities:
+        unknown.append(source)
+    if unknown:
+        state.tainted_paths.update(unknown)
+        raise _ParkedSourceConflict("source 已被未知目录项替换")
+    if parked_identity != expected_source:
+        raise _TransactionConflict("parked 内容身份不符合预期")
+    if source_after is not None:
+        raise _TransactionConflict("park 后 source 路径又出现目录项")
+    return placeholder
 
 
 def _move_noreplace(
     source: Path,
     destination: Path,
     expected_source: _EntryIdentity,
+    park_state: _ParkState,
 ) -> None:
-    """以 link + unlink 完成同卷 NOREPLACE 移动，并逐步观测身份。"""
+    """以 link + 私有 park 完成同卷 NOREPLACE 移动。"""
+    park_state.watched_sources.add(source)
     if _entry_identity(source) != expected_source:
         raise _TransactionConflict("源文件身份已变化")
     if _entry_identity(destination) is not None:
@@ -568,11 +691,9 @@ def _move_noreplace(
     if _entry_identity(destination) != expected_source:
         raise _TransactionConflict("硬链接返回后目标身份不符合预期")
 
-    _unlink_file(source)
+    _park_linked_source(source, expected_source, park_state)
     if _entry_identity(destination) != expected_source:
-        raise _TransactionConflict("移除源文件后目标身份发生变化")
-    if _entry_identity(source) is not None:
-        raise _TransactionConflict("移除源文件后原路径仍有目录项")
+        raise _TransactionConflict("park source 后目标身份发生变化")
 
 
 def _new_staging_dir(destination: Path) -> Path:
@@ -585,15 +706,33 @@ def _new_staging_dir(destination: Path) -> Path:
         ) from None
 
 
-def _write_recovery_guide(staging_dir: Path, label: str) -> bool:
+def _write_recovery_guide(
+    staging_dir: Path,
+    label: str,
+    preserved_unknown: Sequence[Path] = (),
+) -> bool:
     guide = staging_dir / "RECOVERY.txt"
     try:
+        if preserved_unknown:
+            headline = (
+                f"{label}发布期间检测到 source 换包；"
+                "未知目录项已保留，事务未标记为成功。\n"
+            )
+            unknown_line = "保留路径：" + "；".join(
+                str(path) for path in preserved_unknown
+            ) + "。\n"
+        else:
+            headline = f"{label}发布失败，自动回滚未完成。\n"
+            unknown_line = ""
         content = (
-            f"{label}发布失败，自动回滚未完成。\n"
-            "1. 暂停重试下载，先备份本目录。\n"
-            "2. backups/ 中是发布前的旧文件；new/（若存在）和 "
+            headline
+            + unknown_line
+            + "1. 暂停重试下载，先备份本目录。\n"
+            "2. parked/ 中可能含竞争写入的未知内容，"
+            "绝不能直接删除。\n"
+            "3. backups/ 中是发布前的旧文件；new/（若存在）和 "
             "failed-new/ 中是未发布完整的新文件。\n"
-            "3. 核对输出目录中对应的最终文件，"
+            "4. 核对输出目录中对应的最终文件，"
             "再将 backups/ 中缺失的旧文件移回。\n"
         )
         _write_exclusive_bytes(guide, content.encode("utf-8"))
@@ -608,6 +747,7 @@ def _rollback_transaction(
     staged_identities: dict[Path, _EntryIdentity],
     initial_states: dict[Path, _EntryIdentity | None],
     staging_dir: Path,
+    park_state: _ParkState,
 ) -> bool:
     """只依据实时 lstat 身份恢复事务前状态，不信任进度列表。"""
     backups_dir = staging_dir / "backups"
@@ -620,17 +760,28 @@ def _rollback_transaction(
         if current_final == initial_identity:
             continue
         if current_final == staged_identity:
-            # 尽量保留唯一的新产物副本；失败也要继续恢复旧槽位。
             failed_path = failed_new_dir / final_path.name
+            # 优先用完整 link+park 原语保留 failed-new；任何 after-op
+            # 异常都靠随后的 lstat 决定是否还需单独 park source。
             if _entry_identity(failed_path) is None:
                 try:
-                    _link_file(final_path, failed_path)
+                    _move_noreplace(
+                        final_path,
+                        failed_path,
+                        staged_identity,
+                        park_state,
+                    )
                 except BaseException:
                     pass
-            # 重新观测后才删除，未知竞态文件绝不触碰。
+            # 若 link 已完成但 park 未完成，或 failed-new 槽位冲突，
+            # 仍只把 source 原子搬进私有 placeholder，绝不 unlink。
             if _entry_identity(final_path) == staged_identity:
                 try:
-                    _unlink_file(final_path)
+                    _park_linked_source(
+                        final_path,
+                        staged_identity,
+                        park_state,
+                    )
                 except BaseException:
                     pass
             current_final = _entry_identity(final_path)
@@ -684,6 +835,13 @@ def _publish_transaction(
     failed_new_dir = staging_dir / "failed-new"
     backups_dir.mkdir()
     failed_new_dir.mkdir()
+    known_identities = set(staged_identities.values())
+    known_identities.update(
+        identity
+        for identity in initial_states.values()
+        if identity is not None
+    )
+    park_state = _new_park_state(staging_dir, known_identities)
 
     try:
         for _staged_path, final_path in staged_and_final:
@@ -694,6 +852,7 @@ def _publish_transaction(
                 final_path,
                 backups_dir / final_path.name,
                 identity,
+                park_state,
             )
 
         for staged_path, final_path in staged_and_final:
@@ -701,11 +860,18 @@ def _publish_transaction(
                 staged_path,
                 final_path,
                 staged_identities[staged_path],
+                park_state,
+            )
+        unknown = _find_unknown_transaction_entries(park_state)
+        if unknown:
+            park_state.tainted_paths.update(unknown)
+            raise _ParkedSourceConflict(
+                "发布结束时 source 或 parked 出现未知目录项"
             )
         return
     except BaseException as error:
-        # 这个 guard 覆盖 link/unlink 以及所有 mutation 后的身份观测；
-        # 异常发生在“操作已完成、进度尚未记录”的缝隙也能恢复。
+        # 这个 guard 覆盖 link/park 以及所有 mutation 后的身份观测；
+        # “操作完成、进度未记录”的缝隙也能恢复。
         failure = error
 
     try:
@@ -714,13 +880,36 @@ def _publish_transaction(
             staged_identities,
             initial_states,
             staging_dir,
+            park_state,
         )
     except BaseException:
         rollback_complete = False
 
-    if not rollback_complete:
+    inspection_uncertain = False
+    try:
+        unknown = _find_unknown_transaction_entries(park_state)
+        park_state.tainted_paths.update(unknown)
+    except BaseException:
+        inspection_uncertain = True
+
+    source_swap_detected = (
+        inspection_uncertain
+        or isinstance(failure, _ParkedSourceConflict)
+        or any(
+            path == staging_dir or staging_dir in path.parents
+            for path in park_state.tainted_paths
+        )
+    )
+    if not rollback_complete or source_swap_detected:
+        preserved_unknown = sorted(park_state.tainted_paths, key=str)
+        if inspection_uncertain and not preserved_unknown:
+            preserved_unknown = [park_state.directory]
         try:
-            guide_written = _write_recovery_guide(staging_dir, label)
+            guide_written = _write_recovery_guide(
+                staging_dir,
+                label,
+                preserved_unknown if source_swap_detected else (),
+            )
         except BaseException:
             # 无论说明文件写入遇到什么中断，都先确保唯一备份不被
             # 外层 finally 清理。后续统一通过 RecoveryRequired 报告路径。
@@ -730,8 +919,20 @@ def _publish_transaction(
         else:
             recovery_action = (
                 "恢复说明写入失败；请暂停重试，直接检查 "
-                "backups/、new/、failed-new/ 与最终槽位。"
+                "parked/、backups/、new/、failed-new/ 与最终槽位。"
             )
+        if source_swap_detected:
+            preserved_text = "；".join(
+                str(path) for path in preserved_unknown
+            )
+            raise _RecoveryRequired(
+                f"{label}发布期间检测到 source 换包，"
+                "或无法确认 parked 状态，"
+                "事务未标记为成功。"
+                f"未知内容已保留：{preserved_text}。"
+                f"可恢复资料已保留在：{staging_dir}。"
+                f"{recovery_action}"
+            ) from None
         raise _RecoveryRequired(
             f"{label}发布失败，自动回滚也未完成。"
             f"可恢复资料已保留在：{staging_dir}。"

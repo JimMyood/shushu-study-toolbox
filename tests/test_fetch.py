@@ -1,6 +1,7 @@
 import importlib
 import json
 import math
+import os
 from pathlib import Path
 import re
 import socket
@@ -121,6 +122,41 @@ def _fake_ydl(
             return extracted_info
 
     return FakeYoutubeDL, state
+
+
+def _inject_source_swap_before_park(
+    monkeypatch,
+    fetch,
+    competitor: Path,
+    predicate,
+):
+    """在原子 park 边界前把 source 换成未知普通文件。"""
+    real_park = getattr(fetch, "_replace_source_with_parked", os.replace)
+    state = {"done": False, "source": None, "parked": None}
+
+    def replace_with_swap(source, parked):
+        source = Path(source)
+        parked = Path(parked)
+        if not state["done"] and predicate(source):
+            os.replace(competitor, source)
+            state.update(done=True, source=source, parked=parked)
+        return real_park(source, parked)
+
+    monkeypatch.setattr(
+        fetch,
+        "_replace_source_with_parked",
+        replace_with_swap,
+        raising=False,
+    )
+    return state
+
+
+def _assert_swap_is_parked(state, expected: bytes) -> None:
+    assert state["done"] is True
+    parked = state["parked"]
+    assert isinstance(parked, Path)
+    assert parked.parent.name == "parked"
+    assert parked.read_bytes() == expected
 
 
 def test_build_video_opts_limits_height_and_uses_canonical_template(tmp_path):
@@ -761,15 +797,17 @@ def test_cli_subs_recovers_when_old_backup_move_succeeds_then_raises(
     factory, _state = _fake_ydl(
         {"subtitles": {"en": [{"ext": "vtt"}]}}
     )
-    real_unlink = fetch._unlink_file
+    real_park = fetch._replace_source_with_parked
 
-    def backup_then_raise(path):
-        if path == subtitle_path:
-            real_unlink(path)
+    def backup_then_raise(source, parked):
+        if source == subtitle_path:
+            real_park(source, parked)
             raise OSError("secret post-move subtitle backup error")
-        return real_unlink(path)
+        return real_park(source, parked)
 
-    monkeypatch.setattr(fetch, "_unlink_file", backup_then_raise)
+    monkeypatch.setattr(
+        fetch, "_replace_source_with_parked", backup_then_raise
+    )
 
     exit_code = fetch.main(
         [
@@ -800,15 +838,17 @@ def test_cli_subs_removes_new_file_when_publish_succeeds_then_raises(
     factory, _state = _fake_ydl(
         {"subtitles": {"en": [{"ext": "vtt"}]}}
     )
-    real_unlink = fetch._unlink_file
+    real_park = fetch._replace_source_with_parked
 
-    def publish_then_raise(path):
-        if path.name == "subs.orig.downloaded.srt":
-            real_unlink(path)
+    def publish_then_raise(source, parked):
+        if source.name == "subs.orig.downloaded.srt":
+            real_park(source, parked)
             raise OSError("secret post-move subtitle publish error")
-        return real_unlink(path)
+        return real_park(source, parked)
 
-    monkeypatch.setattr(fetch, "_unlink_file", publish_then_raise)
+    monkeypatch.setattr(
+        fetch, "_replace_source_with_parked", publish_then_raise
+    )
 
     exit_code = fetch.main(
         [
@@ -1191,15 +1231,17 @@ def test_cli_audio_recovers_when_old_backup_move_succeeds_then_raises(
     previous = b"only-old-audio"
     audio_path.write_bytes(previous)
     factory, _state = _fake_ydl({"title": "new"})
-    real_unlink = fetch._unlink_file
+    real_park = fetch._replace_source_with_parked
 
-    def backup_then_raise(path):
-        if path == audio_path:
-            real_unlink(path)
+    def backup_then_raise(source, parked):
+        if source == audio_path:
+            real_park(source, parked)
             raise OSError("secret post-move audio backup error")
-        return real_unlink(path)
+        return real_park(source, parked)
 
-    monkeypatch.setattr(fetch, "_unlink_file", backup_then_raise)
+    monkeypatch.setattr(
+        fetch, "_replace_source_with_parked", backup_then_raise
+    )
 
     exit_code = fetch.main(
         [
@@ -1229,15 +1271,17 @@ def test_cli_audio_recovers_old_when_publish_succeeds_then_raises(
     previous = b"old-audio"
     audio_path.write_bytes(previous)
     factory, _state = _fake_ydl({"title": "new"})
-    real_unlink = fetch._unlink_file
+    real_park = fetch._replace_source_with_parked
 
-    def publish_then_raise(path):
-        if path.parent.name == "new" and path.name == "audio.m4a":
-            real_unlink(path)
+    def publish_then_raise(source, parked):
+        if source.parent.name == "new" and source.name == "audio.m4a":
+            real_park(source, parked)
             raise OSError("secret post-move audio publish error")
-        return real_unlink(path)
+        return real_park(source, parked)
 
-    monkeypatch.setattr(fetch, "_unlink_file", publish_then_raise)
+    monkeypatch.setattr(
+        fetch, "_replace_source_with_parked", publish_then_raise
+    )
 
     exit_code = fetch.main(
         [
@@ -1367,20 +1411,23 @@ def test_cli_atomic_publish_never_overwrites_competing_destination(
     assert str(recovery_dirs[0]) in captured.err
 
 
-def test_cli_rolls_back_when_link_succeeds_but_source_unlink_raises(
+def test_cli_rolls_back_when_link_succeeds_but_source_park_raises(
     tmp_path, monkeypatch, capsys
 ):
     fetch = _fetch_module()
     output_dir = tmp_path / "out"
     audio_path = output_dir / "audio.m4a"
     factory, _state = _fake_ydl({"title": "new"})
+    real_park = fetch._replace_source_with_parked
 
-    def fail_staged_unlink(path):
-        if path.parent.name == "new" and path.name == "audio.m4a":
-            raise OSError("secret source unlink failure")
-        return path.unlink()
+    def fail_staged_park(source, parked):
+        if source.parent.name == "new" and source.name == "audio.m4a":
+            raise OSError("secret source park failure")
+        return real_park(source, parked)
 
-    monkeypatch.setattr(fetch, "_unlink_file", fail_staged_unlink, raising=False)
+    monkeypatch.setattr(
+        fetch, "_replace_source_with_parked", fail_staged_park
+    )
 
     exit_code = fetch.main(
         [
@@ -1397,6 +1444,352 @@ def test_cli_rolls_back_when_link_succeeds_but_source_unlink_raises(
     assert not audio_path.exists()
     assert list(output_dir.glob(".fetch-*")) == []
     assert "原输出状态已恢复" in captured.err
+    assert "secret" not in captured.out + captured.err
+
+
+def test_cli_audio_parks_source_swapped_during_old_backup(
+    tmp_path, monkeypatch, capsys
+):
+    fetch = _fetch_module()
+    output_dir = tmp_path / "out"
+    output_dir.mkdir()
+    audio_path = output_dir / "audio.m4a"
+    audio_path.write_bytes(b"OLD_AUDIO")
+    competitor = output_dir / "competing-audio.tmp"
+    competitor.write_bytes(b"COMPETING_AUDIO")
+    factory, _state = _fake_ydl({"title": "new"})
+    swap = _inject_source_swap_before_park(
+        monkeypatch,
+        fetch,
+        competitor,
+        lambda source: source == audio_path,
+    )
+
+    exit_code = fetch.main(
+        [
+            "audio",
+            "https://example.test/video",
+            "--out",
+            str(output_dir),
+        ],
+        ydl_factory=factory,
+    )
+
+    captured = capsys.readouterr()
+    recovery_dirs = list(output_dir.glob(".fetch-*"))
+    assert exit_code == 1
+    assert audio_path.read_bytes() == b"OLD_AUDIO"
+    assert len(recovery_dirs) == 1
+    assert (
+        recovery_dirs[0] / "backups" / "audio.m4a"
+    ).read_bytes() == b"OLD_AUDIO"
+    assert "parked/" in (
+        recovery_dirs[0] / "RECOVERY.txt"
+    ).read_text(encoding="utf-8")
+    _assert_swap_is_parked(swap, b"COMPETING_AUDIO")
+    assert "parked" in captured.err
+    assert str(swap["parked"]) in captured.err
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [OSError("after park"), KeyboardInterrupt(), SystemExit(9)],
+)
+def test_cli_audio_preserves_swap_when_park_raises_after_operation(
+    tmp_path, monkeypatch, capsys, failure
+):
+    fetch = _fetch_module()
+    output_dir = tmp_path / "out"
+    output_dir.mkdir()
+    audio_path = output_dir / "audio.m4a"
+    audio_path.write_bytes(b"OLD_AUDIO")
+    competitor = output_dir / "competing-after-op.tmp"
+    competitor.write_bytes(b"COMPETING_AFTER_OP")
+    factory, _state = _fake_ydl({"title": "new"})
+    real_park = fetch._replace_source_with_parked
+    state = {"parked": None}
+
+    def swap_park_then_raise(source, parked):
+        if source == audio_path:
+            os.replace(competitor, source)
+            real_park(source, parked)
+            state["parked"] = parked
+            raise failure
+        return real_park(source, parked)
+
+    monkeypatch.setattr(
+        fetch,
+        "_replace_source_with_parked",
+        swap_park_then_raise,
+    )
+
+    try:
+        exit_code = fetch.main(
+            [
+                "audio",
+                "https://example.test/video",
+                "--out",
+                str(output_dir),
+            ],
+            ydl_factory=factory,
+        )
+    except (KeyboardInterrupt, SystemExit):
+        pytest.fail("未知 parked 内容存在时必须先保留 recovery")
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert audio_path.read_bytes() == b"OLD_AUDIO"
+    assert isinstance(state["parked"], Path)
+    assert state["parked"].read_bytes() == b"COMPETING_AFTER_OP"
+    assert len(list(output_dir.glob(".fetch-*"))) == 1
+    assert "parked" in captured.err
+
+
+def test_cli_audio_parks_source_swapped_during_empty_publish(
+    tmp_path, monkeypatch, capsys
+):
+    fetch = _fetch_module()
+    output_dir = tmp_path / "out"
+    output_dir.mkdir()
+    audio_path = output_dir / "audio.m4a"
+    competitor = output_dir / "competing-audio.tmp"
+    competitor.write_bytes(b"COMPETING_PUBLISH_AUDIO")
+    factory, _state = _fake_ydl({"title": "new"})
+    swap = _inject_source_swap_before_park(
+        monkeypatch,
+        fetch,
+        competitor,
+        lambda source: (
+            source.parent.name == "new" and source.name == "audio.m4a"
+        ),
+    )
+
+    exit_code = fetch.main(
+        [
+            "audio",
+            "https://example.test/video",
+            "--out",
+            str(output_dir),
+        ],
+        ydl_factory=factory,
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert not audio_path.exists()
+    assert len(list(output_dir.glob(".fetch-*"))) == 1
+    _assert_swap_is_parked(swap, b"COMPETING_PUBLISH_AUDIO")
+    assert "parked" in captured.err
+
+
+def test_cli_audio_preserves_unknown_source_recreated_after_park(
+    tmp_path, monkeypatch, capsys
+):
+    fetch = _fetch_module()
+    output_dir = tmp_path / "out"
+    output_dir.mkdir()
+    audio_path = output_dir / "audio.m4a"
+    factory, _state = _fake_ydl({"title": "new"})
+    real_park = fetch._replace_source_with_parked
+    state = {"source": None}
+
+    def park_then_recreate(source, parked):
+        real_park(source, parked)
+        if source.parent.name == "new" and source.name == "audio.m4a":
+            source.write_bytes(b"UNKNOWN_RECREATED_SOURCE")
+            state["source"] = source
+
+    monkeypatch.setattr(
+        fetch,
+        "_replace_source_with_parked",
+        park_then_recreate,
+    )
+
+    exit_code = fetch.main(
+        [
+            "audio",
+            "https://example.test/video",
+            "--out",
+            str(output_dir),
+        ],
+        ydl_factory=factory,
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert not audio_path.exists()
+    assert isinstance(state["source"], Path)
+    assert state["source"].read_bytes() == b"UNKNOWN_RECREATED_SOURCE"
+    assert len(list(output_dir.glob(".fetch-*"))) == 1
+    assert "parked" in captured.err
+
+
+def test_cli_video_parks_metadata_swapped_during_old_pair_backup(
+    tmp_path, monkeypatch, capsys
+):
+    fetch = _fetch_module()
+    output_dir = tmp_path / "out"
+    output_dir.mkdir()
+    video_path = output_dir / "video.mp4"
+    metadata_path = output_dir / "meta.json"
+    video_path.write_bytes(b"OLD_VIDEO")
+    metadata_path.write_bytes(b"OLD_METADATA")
+    competitor = output_dir / "competing-meta.tmp"
+    competitor.write_bytes(b"COMPETING_METADATA")
+    factory, _state = _fake_ydl({"title": "new"})
+    swap = _inject_source_swap_before_park(
+        monkeypatch,
+        fetch,
+        competitor,
+        lambda source: source == metadata_path,
+    )
+
+    exit_code = fetch.main(
+        [
+            "video",
+            "https://example.test/video",
+            "--out",
+            str(output_dir),
+        ],
+        ydl_factory=factory,
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert video_path.read_bytes() == b"OLD_VIDEO"
+    assert metadata_path.read_bytes() == b"OLD_METADATA"
+    assert len(list(output_dir.glob(".fetch-*"))) == 1
+    _assert_swap_is_parked(swap, b"COMPETING_METADATA")
+    assert "parked" in captured.err
+
+
+@pytest.mark.parametrize("target", ["video", "metadata"])
+def test_cli_video_parks_source_swapped_during_empty_publish(
+    tmp_path, monkeypatch, capsys, target
+):
+    fetch = _fetch_module()
+    output_dir = tmp_path / "out"
+    output_dir.mkdir()
+    competitor = output_dir / f"competing-{target}.tmp"
+    competing_content = f"COMPETING_{target.upper()}".encode("ascii")
+    competitor.write_bytes(competing_content)
+    factory, _state = _fake_ydl({"title": "new"})
+
+    def is_target(source):
+        if source.parent.name != "new":
+            return False
+        if target == "video":
+            return source.name == "video.mp4"
+        return source.name.startswith(".meta-")
+
+    swap = _inject_source_swap_before_park(
+        monkeypatch, fetch, competitor, is_target
+    )
+
+    exit_code = fetch.main(
+        [
+            "video",
+            "https://example.test/video",
+            "--out",
+            str(output_dir),
+        ],
+        ydl_factory=factory,
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert not (output_dir / "video.mp4").exists()
+    assert not (output_dir / "meta.json").exists()
+    assert len(list(output_dir.glob(".fetch-*"))) == 1
+    _assert_swap_is_parked(swap, competing_content)
+    assert "parked" in captured.err
+
+
+def test_cli_subs_parks_source_swapped_during_empty_publish(
+    tmp_path, monkeypatch, capsys
+):
+    fetch = _fetch_module()
+    output_dir = tmp_path / "out"
+    output_dir.mkdir()
+    competitor = output_dir / "competing-subtitle.tmp"
+    competitor.write_bytes(b"COMPETING_SUBTITLE")
+    factory, _state = _fake_ydl(
+        {"subtitles": {"en": [{"ext": "vtt"}]}}
+    )
+    swap = _inject_source_swap_before_park(
+        monkeypatch,
+        fetch,
+        competitor,
+        lambda source: source.name == "subs.orig.downloaded.srt",
+    )
+
+    exit_code = fetch.main(
+        [
+            "subs",
+            "https://example.test/video",
+            "--lang",
+            "en",
+            "--out",
+            str(output_dir),
+        ],
+        ydl_factory=factory,
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert not (output_dir / "subs.orig.srt").exists()
+    assert len(list(output_dir.glob(".fetch-*"))) == 1
+    _assert_swap_is_parked(swap, b"COMPETING_SUBTITLE")
+    assert "parked" in captured.err
+
+
+def test_cli_video_parks_source_swapped_during_rollback_removal(
+    tmp_path, monkeypatch, capsys
+):
+    fetch = _fetch_module()
+    output_dir = tmp_path / "out"
+    output_dir.mkdir()
+    video_path = output_dir / "video.mp4"
+    metadata_path = output_dir / "meta.json"
+    video_path.write_bytes(b"OLD_VIDEO")
+    metadata_path.write_bytes(b"OLD_METADATA")
+    competitor = output_dir / "competing-rollback.tmp"
+    competitor.write_bytes(b"COMPETING_ROLLBACK")
+    factory, _state = _fake_ydl({"title": "new"})
+    real_link = fetch._link_file
+    phase = {"rollback": False}
+
+    def fail_metadata_publish(source, destination):
+        if source.parent.name == "new" and destination == metadata_path:
+            phase["rollback"] = True
+            raise OSError("secret second publish failure")
+        return real_link(source, destination)
+
+    monkeypatch.setattr(fetch, "_link_file", fail_metadata_publish)
+    swap = _inject_source_swap_before_park(
+        monkeypatch,
+        fetch,
+        competitor,
+        lambda source: phase["rollback"] and source == video_path,
+    )
+
+    exit_code = fetch.main(
+        [
+            "video",
+            "https://example.test/video",
+            "--out",
+            str(output_dir),
+        ],
+        ydl_factory=factory,
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert video_path.read_bytes() == b"OLD_VIDEO"
+    assert metadata_path.read_bytes() == b"OLD_METADATA"
+    assert len(list(output_dir.glob(".fetch-*"))) == 1
+    _assert_swap_is_parked(swap, b"COMPETING_ROLLBACK")
+    assert "parked" in captured.err
     assert "secret" not in captured.out + captured.err
 
 
@@ -1628,16 +2021,18 @@ def test_cli_video_recovers_when_backup_move_succeeds_then_raises(
     video_path.write_bytes(b"only-old-video")
     metadata_path.write_bytes(b"only-old-metadata")
     factory, _state = _fake_ydl({"title": "new"})
-    real_unlink = fetch._unlink_file
+    real_park = fetch._replace_source_with_parked
 
-    def move_video_backup_then_raise(path):
-        if path == video_path:
-            real_unlink(path)
+    def move_video_backup_then_raise(source, parked):
+        if source == video_path:
+            real_park(source, parked)
             raise OSError("secret post-move backup error")
-        return real_unlink(path)
+        return real_park(source, parked)
 
     monkeypatch.setattr(
-        fetch, "_unlink_file", move_video_backup_then_raise
+        fetch,
+        "_replace_source_with_parked",
+        move_video_backup_then_raise,
     )
 
     exit_code = fetch.main(
@@ -1667,15 +2062,17 @@ def test_cli_video_removes_both_new_files_when_meta_move_succeeds_then_raises(
     factory, _state = _fake_ydl({"title": "new"})
     video_path = output_dir / "video.mp4"
     metadata_path = output_dir / "meta.json"
-    real_unlink = fetch._unlink_file
+    real_park = fetch._replace_source_with_parked
 
-    def publish_meta_then_raise(path):
-        if path.parent.name == "new" and path.name.startswith(".meta-"):
-            real_unlink(path)
+    def publish_meta_then_raise(source, parked):
+        if source.parent.name == "new" and source.name.startswith(".meta-"):
+            real_park(source, parked)
             raise OSError("secret post-move metadata error")
-        return real_unlink(path)
+        return real_park(source, parked)
 
-    monkeypatch.setattr(fetch, "_unlink_file", publish_meta_then_raise)
+    monkeypatch.setattr(
+        fetch, "_replace_source_with_parked", publish_meta_then_raise
+    )
 
     exit_code = fetch.main(
         [
@@ -1709,21 +2106,23 @@ def test_cli_video_rolls_back_and_reraises_interruptions(
     video_path.write_bytes(b"old-video")
     metadata_path.write_bytes(b"old-metadata")
     factory, _state = _fake_ydl({"title": "new"})
-    real_unlink = fetch._unlink_file
+    real_park = fetch._replace_source_with_parked
 
-    def move_then_interrupt(path):
-        is_backup = path == video_path
+    def move_then_interrupt(source, parked):
+        is_backup = source == video_path
         is_publish = (
-            path.parent.name == "new" and path.name == "video.mp4"
+            source.parent.name == "new" and source.name == "video.mp4"
         )
         if (stage == "backup" and is_backup) or (
             stage == "publish" and is_publish
         ):
-            real_unlink(path)
+            real_park(source, parked)
             raise interruption
-        return real_unlink(path)
+        return real_park(source, parked)
 
-    monkeypatch.setattr(fetch, "_unlink_file", move_then_interrupt)
+    monkeypatch.setattr(
+        fetch, "_replace_source_with_parked", move_then_interrupt
+    )
 
     with pytest.raises(type(interruption)) as caught:
         fetch.main(
@@ -1754,21 +2153,24 @@ def test_cli_video_rolls_back_post_move_observation_interrupt(
     metadata_path.write_bytes(b"old-metadata")
     factory, _state = _fake_ydl({"title": "new"})
     real_identity = fetch._entry_identity
-    state = {"after_backup_unlink": False, "raised": False}
+    real_park = fetch._replace_source_with_parked
+    state = {"after_backup_park": False, "raised": False}
     interruption = KeyboardInterrupt()
 
-    def unlink_then_mark(path):
-        path.unlink()
-        if path == video_path:
-            state["after_backup_unlink"] = True
+    def park_then_mark(source, parked):
+        real_park(source, parked)
+        if source == video_path:
+            state["after_backup_park"] = True
 
     def interrupt_post_move_observation(path):
-        if state["after_backup_unlink"] and not state["raised"]:
+        if state["after_backup_park"] and not state["raised"]:
             state["raised"] = True
             raise interruption
         return real_identity(path)
 
-    monkeypatch.setattr(fetch, "_unlink_file", unlink_then_mark, raising=False)
+    monkeypatch.setattr(
+        fetch, "_replace_source_with_parked", park_then_mark
+    )
     monkeypatch.setattr(fetch, "_entry_identity", interrupt_post_move_observation)
 
     with pytest.raises(KeyboardInterrupt) as caught:
@@ -1858,14 +2260,14 @@ def test_cli_video_interrupt_with_failed_rollback_keeps_recovery(
     metadata_path.write_bytes(b"old-metadata")
     factory, _state = _fake_ydl({"title": "new"})
     real_link = fetch._link_file
-    real_unlink = fetch._unlink_file
+    real_park = fetch._replace_source_with_parked
     interruption = KeyboardInterrupt()
 
-    def interrupt_publish(path):
-        if path.parent.name == "new" and path.name == "video.mp4":
-            real_unlink(path)
+    def interrupt_publish(source, parked):
+        if source.parent.name == "new" and source.name == "video.mp4":
+            real_park(source, parked)
             raise interruption
-        return real_unlink(path)
+        return real_park(source, parked)
 
     def fail_video_restore(source, destination):
         if (
@@ -1876,7 +2278,9 @@ def test_cli_video_interrupt_with_failed_rollback_keeps_recovery(
             raise OSError("secret rollback error")
         return real_link(source, destination)
 
-    monkeypatch.setattr(fetch, "_unlink_file", interrupt_publish)
+    monkeypatch.setattr(
+        fetch, "_replace_source_with_parked", interrupt_publish
+    )
     monkeypatch.setattr(fetch, "_link_file", fail_video_restore)
 
     try:
