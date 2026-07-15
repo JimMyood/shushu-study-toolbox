@@ -26,8 +26,22 @@ def load_config() -> dict:
         print("复制 config.example.json 为 config.json 可自定义")
         return DEFAULTS.copy()
 
+    try:
+        user_config = json.loads(config_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        raise ValueError(
+            f"配置文件 {config_path} 不是有效的 JSON。"
+            "请修正该文件，或删除后复制 config.example.json 为 config.json。"
+        ) from None
+
+    if not isinstance(user_config, dict):
+        raise ValueError(
+            f"配置文件 {config_path} 顶层必须是 JSON 对象。"
+            "请修正该文件，或删除后复制 config.example.json 为 config.json。"
+        )
+
     config = DEFAULTS.copy()
-    config.update(json.loads(config_path.read_text(encoding="utf-8")))
+    config.update(user_config)
     return config
 
 
