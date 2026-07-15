@@ -373,6 +373,64 @@ def test_chunk_v2_stale_target_race_uses_next_name_without_overwriting_competito
     assert "secret" not in captured.err
 
 
+def test_chunk_v2_park_failure_reports_complete_rollback_and_archive(
+    tmp_path, monkeypatch, capsys
+):
+    srt_tools = _load_srt_tools()
+    input_path = tmp_path / "source.srt"
+    input_path.write_text(
+        "1\n00:00:00,000 --> 00:00:01,000\nAlpha\n",
+        encoding="utf-8",
+    )
+    chunks_dir = tmp_path / "chunks"
+    assert srt_tools.chunk_subtitles(input_path, 1, chunks_dir) == 0
+    translation_path = chunks_dir / "chunk_000.translated.txt"
+    old_translation = b"OLD_TRANSLATION\n"
+    translation_path.write_bytes(old_translation)
+    input_path.write_text(
+        "1\n00:00:00,000 --> 00:00:01,000\nBeta\n",
+        encoding="utf-8",
+    )
+    manifest_before = (chunks_dir / "manifest.json").read_bytes()
+    source_before = (chunks_dir / "chunk_000.txt").read_bytes()
+    real_replace = os.replace
+    injected = {"done": False}
+
+    def fail_first_source_park(source, target, *args, **kwargs):
+        source = Path(source)
+        target = Path(target)
+        if (
+            source == translation_path
+            and target.parent.name.startswith(".srt-safety-archive-")
+            and not injected["done"]
+        ):
+            injected["done"] = True
+            raise OSError(errno.EIO, "secret source park failure")
+        return real_replace(source, target, *args, **kwargs)
+
+    monkeypatch.setattr(os, "replace", fail_first_source_park)
+
+    exit_code = srt_tools.chunk_subtitles(input_path, 1, chunks_dir)
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert injected["done"] is True
+    assert "无法安全隔离第 1 块旧译文" in captured.err
+    assert "回滚一致点已确认旧译文完整恢复" in captured.err
+    assert "安全归档保留供核对" in captured.err
+    assert "请勿自动删除" in captured.err
+    assert "译文路径在隔离时发生变化" not in captured.err
+    assert "secret" not in captured.err
+    assert translation_path.read_bytes() == old_translation
+    archives = list(chunks_dir.glob(".srt-safety-archive-*"))
+    assert len(archives) == 1
+    assert old_translation in _regular_file_payloads(archives[0])
+    assert str(archives[0]) in captured.err
+    assert not list(chunks_dir.glob("chunk_000.stale-*.txt"))
+    assert (chunks_dir / "manifest.json").read_bytes() == manifest_before
+    assert (chunks_dir / "chunk_000.txt").read_bytes() == source_before
+
+
 def test_chunk_v2_source_swap_is_preserved_in_recovery_and_never_reports_success(
     tmp_path, monkeypatch, capsys
 ):

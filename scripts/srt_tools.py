@@ -734,6 +734,15 @@ def chunk_subtitles(input_path: Path, size: int, out_dir: Path) -> int:
                             f"{recovery_message}清单与源分块未更新，请人工核对",
                             file=sys.stderr,
                         )
+                    elif error.recovery_dir is not None:
+                        print(
+                            f"无法安全隔离第 {number + 1} 块旧译文；"
+                            "回滚一致点已确认旧译文完整恢复，"
+                            "清单与源分块未更新；"
+                            f"安全归档保留供核对：{error.recovery_dir}。"
+                            "请勿自动删除，修复问题后重试",
+                            file=sys.stderr,
+                        )
                     else:
                         print(
                             f"无法安全隔离第 {number + 1} 块旧译文；"
