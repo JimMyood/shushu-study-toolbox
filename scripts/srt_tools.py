@@ -293,19 +293,19 @@ def _try_entry_identity(path: Path) -> tuple[int, int, int] | None:
         return None
 
 
-def _create_recovery_dir(out_dir: Path) -> Path:
-    recovery_dir = Path(
-        tempfile.mkdtemp(prefix=".srt-recovery-", dir=out_dir)
+def _create_safety_archive(out_dir: Path) -> Path:
+    archive_dir = Path(
+        tempfile.mkdtemp(prefix=".srt-safety-archive-", dir=out_dir)
     )
-    recovery_dir.chmod(0o700)
-    return recovery_dir
+    archive_dir.chmod(0o700)
+    return archive_dir
 
 
 def _create_owned_placeholder(
-    recovery_dir: Path, label: str
+    archive_dir: Path, label: str
 ) -> tuple[Path, tuple[int, int, int]]:
     descriptor, raw_path = tempfile.mkstemp(
-        prefix=f".{label}.", suffix=".park", dir=recovery_dir
+        prefix=f".{label}.", suffix=".preserved", dir=archive_dir
     )
     try:
         if hasattr(os, "fchmod"):
@@ -330,10 +330,10 @@ def _remove_private_entry(
 
 
 def _park_entry(
-    source: Path, recovery_dir: Path
+    source: Path, archive_dir: Path
 ) -> tuple[Path, tuple[int, int, int]]:
     park_path, placeholder_identity = _create_owned_placeholder(
-        recovery_dir, source.name
+        archive_dir, source.name
     )
     try:
         os.replace(source, park_path)
@@ -366,9 +366,8 @@ def _link_unique_stale(
 
 
 def _rollback_isolations(
-    records: list[dict[str, object]], recovery_dir: Path
-) -> tuple[bool, Path | None]:
-    partial_state = False
+    records: list[dict[str, object]], archive_dir: Path
+) -> tuple[bool, Path]:
 
     for record in records:
         source = record["source"]
@@ -388,13 +387,11 @@ def _rollback_isolations(
                     os.link(carrier, source, follow_symlinks=False)
                 except OSError as error:
                     if error.errno != errno.EEXIST:
-                        partial_state = True
+                        break
                 break
             current_identity = _try_entry_identity(source)
         restored = current_identity == expected
         record["restored"] = restored
-        if not restored:
-            partial_state = True
 
     for record in reversed(records):
         source = record["source"]
@@ -410,18 +407,14 @@ def _rollback_isolations(
         if stale_identity is None:
             continue
         if not restored and stale_identity == expected:
-            partial_state = True
             continue
         try:
             parked_path, parked_identity = _park_entry(
-                stale_path, recovery_dir
+                stale_path, archive_dir
             )
         except OSError:
-            partial_state = True
             continue
         record["parks"].append((parked_path, parked_identity))
-        if parked_identity != expected:
-            partial_state = True
 
     for record in records:
         source = record["source"]
@@ -429,39 +422,20 @@ def _rollback_isolations(
         assert isinstance(source, Path) and isinstance(expected, tuple)
         restored = _try_entry_identity(source) == expected
         record["restored"] = restored
-        if not restored:
-            partial_state = True
 
-    for record in records:
-        expected = record["identity"]
-        restored = record.get("restored") is True
-        assert isinstance(expected, tuple)
-        for parked_path, parked_identity in record["parks"]:
-            if parked_identity == expected and restored:
-                if not _remove_private_entry(parked_path, expected):
-                    partial_state = True
-            else:
-                partial_state = True
-
-    try:
-        remaining = list(recovery_dir.iterdir())
-    except OSError:
-        return True, recovery_dir
-    if remaining:
-        return True, recovery_dir
-    try:
-        recovery_dir.rmdir()
-    except OSError:
-        return True, recovery_dir
-    return partial_state, None
+    # 可移植文件 API 没有“仅当另一路径仍指向同一 inode 时才删除”的
+    # compare-and-unlink。回滚后也必须保留至少一个私有硬链接，否则源路径在
+    # 最后一次校验后被并发换包时，删除 parked 会让旧译文永久丢失。
+    return True, archive_dir
 
 
 def _isolate_regular_entries(
     entries: list[tuple[Path, str]], out_dir: Path
-) -> list[Path]:
+) -> tuple[list[Path], Path | None]:
     records: list[dict[str, object]] = []
-    recovery_dir: Path | None = None
+    archive_dir: Path | None = None
     reason = "operation"
+    preserve_archive = False
 
     try:
         validated = []
@@ -492,18 +466,19 @@ def _isolate_regular_entries(
                 raise OSError("stale identity changed")
 
         if not records:
-            return []
-        recovery_dir = _create_recovery_dir(out_dir)
+            return [], None
+        archive_dir = _create_safety_archive(out_dir)
         for record in records:
             source = record["source"]
             expected = record["identity"]
             assert isinstance(source, Path) and isinstance(expected, tuple)
-            parked_path, parked_identity = _park_entry(source, recovery_dir)
+            parked_path, parked_identity = _park_entry(source, archive_dir)
             record["parks"].append((parked_path, parked_identity))
             if parked_identity != expected:
                 reason = "source_changed"
                 raise OSError("source identity changed")
 
+        preserve_archive = True
         for record in records:
             stale_path = record["stale"]
             expected = record["identity"]
@@ -525,24 +500,39 @@ def _isolate_regular_entries(
             for parked_path, parked_identity in record["parks"]:
                 if (
                     parked_identity != expected
-                    or not _remove_private_entry(parked_path, expected)
+                    or _try_entry_identity(parked_path) != expected
                 ):
                     reason = "recovery_changed"
                     raise OSError("recovery identity changed")
-        recovery_dir.rmdir()
-        return [record["stale"] for record in records]
+
+        # 第一次公开 stale 校验返回后仍可能被并发换包；私有安全归档不删除，
+        # 并在提交前再核对一次，既能报告已发生的竞争，也不会丢掉旧译文。
+        for record in records:
+            stale_path = record["stale"]
+            expected = record["identity"]
+            assert isinstance(stale_path, Path) and isinstance(expected, tuple)
+            if _try_entry_identity(stale_path) != expected:
+                reason = "stale_changed"
+                raise OSError("stale identity changed before commit")
+
+        return [record["stale"] for record in records], archive_dir
     except StaleIsolationError:
         raise
     except OSError as error:
         if records:
+            if preserve_archive and archive_dir is not None:
+                raise StaleIsolationError(
+                    reason=reason,
+                    recovery_dir=archive_dir,
+                ) from error
             try:
-                recovery_dir = recovery_dir or _create_recovery_dir(out_dir)
+                archive_dir = archive_dir or _create_safety_archive(out_dir)
                 partial_state, remaining_recovery = _rollback_isolations(
-                    records, recovery_dir
+                    records, archive_dir
                 )
             except OSError:
                 partial_state = True
-                remaining_recovery = recovery_dir
+                remaining_recovery = archive_dir
             if partial_state and reason == "operation":
                 reason = "rollback_changed"
             raise StaleIsolationError(
@@ -575,7 +565,7 @@ def _isolate_legacy_translations(out_dir: Path) -> None:
     except OSError as error:
         raise LegacyIsolationError from error
     try:
-        stale_paths = _isolate_regular_entries(
+        stale_paths, archive_dir = _isolate_regular_entries(
             [
                 (
                     legacy_path,
@@ -598,6 +588,12 @@ def _isolate_legacy_translations(out_dir: Path) -> None:
         print(
             f"旧版译文无法验证，已隔离为 {stale_path.name}；"
             "请按当前源文重翻该块",
+            file=sys.stderr,
+        )
+    if archive_dir is not None:
+        print(
+            f"旧版译文私有安全归档：{archive_dir}。"
+            "它是公开 stale 的并发保护副本，请勿自动删除",
             file=sys.stderr,
         )
 
@@ -632,7 +628,7 @@ def chunk_subtitles(input_path: Path, size: int, out_dir: Path) -> int:
                     )
                 elif error.partial_state:
                     recovery_message = (
-                        f"恢复目录：{error.recovery_dir}。"
+                        f"安全归档（恢复目录）：{error.recovery_dir}。"
                         if error.recovery_dir is not None
                         else "未能创建恢复目录。"
                     )
@@ -677,7 +673,7 @@ def chunk_subtitles(input_path: Path, size: int, out_dir: Path) -> int:
                     old_hash[:12] if _is_sha256(old_hash) else "unknown"
                 )
                 try:
-                    stale_path = _isolate_regular_entries(
+                    stale_paths, archive_dir = _isolate_regular_entries(
                         [
                             (
                                 translation_path,
@@ -685,7 +681,9 @@ def chunk_subtitles(input_path: Path, size: int, out_dir: Path) -> int:
                             )
                         ],
                         out_dir,
-                    )[0]
+                    )
+                    stale_path = stale_paths[0]
+                    assert archive_dir is not None
                 except StaleIsolationError as error:
                     if error.reason == "unsafe":
                         print(
@@ -700,7 +698,7 @@ def chunk_subtitles(input_path: Path, size: int, out_dir: Path) -> int:
                         "recovery_changed",
                     }:
                         recovery_message = (
-                            f"恢复目录：{error.recovery_dir}。"
+                            f"安全归档（恢复目录）：{error.recovery_dir}。"
                             if error.recovery_dir is not None
                             else "未能创建恢复目录。"
                         )
@@ -718,7 +716,8 @@ def chunk_subtitles(input_path: Path, size: int, out_dir: Path) -> int:
                     return 1
                 print(
                     f"第 {number + 1} 块源文已改变；旧译文已保留为 "
-                    f"{stale_path.name}",
+                    f"{stale_path.name}。私有安全归档：{archive_dir}；"
+                    "它是公开 stale 的并发保护副本，请勿自动删除",
                     file=sys.stderr,
                 )
 

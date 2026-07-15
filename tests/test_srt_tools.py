@@ -362,6 +362,11 @@ def test_chunk_v2_stale_target_race_uses_next_name_without_overwriting_competito
     own_stales = [path for path in stale_paths if path != competitor_path]
     assert len(own_stales) == 1
     assert own_stales[0].read_text(encoding="utf-8") == "OLD_TRANSLATION\n"
+    archives = list(chunks_dir.glob(".srt-safety-archive-*"))
+    assert len(archives) == 1
+    assert b"OLD_TRANSLATION\n" in _regular_file_payloads(archives[0])
+    assert str(archives[0]) in captured.err
+    assert "私有安全归档" in captured.err
     assert not translation_path.exists()
     assert (chunks_dir / "manifest.json").read_bytes() != old_manifest
     assert not list(chunks_dir.glob(".srt-recovery-*"))
@@ -397,7 +402,7 @@ def test_chunk_v2_source_swap_is_preserved_in_recovery_and_never_reports_success
         target = Path(target)
         if (
             source == translation_path
-            and target.parent.name.startswith(".srt-recovery-")
+            and target.parent.name.startswith(".srt-safety-archive-")
             and not injected["done"]
         ):
             injected["done"] = True
@@ -418,6 +423,65 @@ def test_chunk_v2_source_swap_is_preserved_in_recovery_and_never_reports_success
     assert (chunks_dir / "chunk_000.txt").read_bytes() == source_chunk_before
     assert translation_path.read_text(encoding="utf-8") == "OLD_TRANSLATION\n"
     assert b"COMPETING_TRANSLATION\n" in _regular_file_payloads(chunks_dir)
+
+
+def test_chunk_v2_stale_swap_after_validation_keeps_old_translation_in_recovery(
+    tmp_path, monkeypatch, capsys
+):
+    srt_tools = _load_srt_tools()
+    input_path = tmp_path / "source.srt"
+    input_path.write_text(
+        "1\n00:00:00,000 --> 00:00:01,000\nAlpha\n",
+        encoding="utf-8",
+    )
+    chunks_dir = tmp_path / "chunks"
+    assert srt_tools.chunk_subtitles(input_path, 1, chunks_dir) == 0
+    translation_path = chunks_dir / "chunk_000.translated.txt"
+    old_translation = b"OLD_TRANSLATION\n"
+    translation_path.write_bytes(old_translation)
+    input_path.write_text(
+        "1\n00:00:00,000 --> 00:00:01,000\nBeta\n",
+        encoding="utf-8",
+    )
+    manifest_before = (chunks_dir / "manifest.json").read_bytes()
+    source_before = (chunks_dir / "chunk_000.txt").read_bytes()
+    competitor_payload = b"COMPETING_STALE\n"
+    competitor = tmp_path / "competitor.tmp"
+    competitor.write_bytes(competitor_payload)
+    real_identity = srt_tools._try_entry_identity
+    real_replace = os.replace
+    injected = {"stale": None}
+
+    def identity_then_swap_public_stale(path):
+        path = Path(path)
+        identity = real_identity(path)
+        if (
+            path.parent == chunks_dir
+            and path.name.startswith("chunk_000.stale-")
+            and injected["stale"] is None
+        ):
+            assert identity is not None
+            injected["stale"] = path
+            real_replace(competitor, path)
+        return identity
+
+    monkeypatch.setattr(
+        srt_tools, "_try_entry_identity", identity_then_swap_public_stale
+    )
+
+    exit_code = srt_tools.chunk_subtitles(input_path, 1, chunks_dir)
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert injected["stale"] is not None
+    assert injected["stale"].read_bytes() == competitor_payload
+    archives = list(chunks_dir.glob(".srt-safety-archive-*"))
+    assert len(archives) == 1
+    assert old_translation in _regular_file_payloads(archives[0])
+    assert str(archives[0]) in captured.err
+    assert "译文路径在隔离时发生变化" in captured.err
+    assert (chunks_dir / "manifest.json").read_bytes() == manifest_before
+    assert (chunks_dir / "chunk_000.txt").read_bytes() == source_before
 
 
 def test_chunk_rejects_non_positive_size_without_traceback(tmp_path):
@@ -854,9 +918,69 @@ def test_chunk_legacy_stale_target_race_uses_next_name_without_overwrite(
     assert own_stales[0].read_text(encoding="utf-8") == (
         "LEGACY_TRANSLATION\n"
     )
+    archives = list(chunks_dir.glob(".srt-safety-archive-*"))
+    assert len(archives) == 1
+    assert b"LEGACY_TRANSLATION\n" in _regular_file_payloads(archives[0])
+    assert str(archives[0]) in captured.err
+    assert "私有安全归档" in captured.err
     assert not legacy_path.exists()
     assert not list(chunks_dir.glob(".srt-recovery-*"))
     assert "secret" not in captured.err
+
+
+def test_chunk_legacy_stale_swap_after_validation_keeps_old_translation_in_recovery(
+    tmp_path, monkeypatch, capsys
+):
+    srt_tools = _load_srt_tools()
+    input_path = tmp_path / "source.srt"
+    input_path.write_text(
+        "1\n00:00:00,000 --> 00:00:01,000\nAlpha\n",
+        encoding="utf-8",
+    )
+    chunks_dir = tmp_path / "chunks"
+    chunks_dir.mkdir()
+    manifest_path = chunks_dir / "manifest.json"
+    manifest_path.write_text("{}\n", encoding="utf-8")
+    manifest_before = manifest_path.read_bytes()
+    legacy_path = chunks_dir / "chunk_000.zh.txt"
+    old_translation = b"LEGACY_TRANSLATION\n"
+    legacy_path.write_bytes(old_translation)
+    competitor_payload = b"COMPETING_LEGACY_STALE\n"
+    competitor = tmp_path / "competitor.tmp"
+    competitor.write_bytes(competitor_payload)
+    real_identity = srt_tools._try_entry_identity
+    real_replace = os.replace
+    injected = {"stale": None}
+
+    def identity_then_swap_public_stale(path):
+        path = Path(path)
+        identity = real_identity(path)
+        if (
+            path.parent == chunks_dir
+            and "stale-legacy" in path.name
+            and injected["stale"] is None
+        ):
+            assert identity is not None
+            injected["stale"] = path
+            real_replace(competitor, path)
+        return identity
+
+    monkeypatch.setattr(
+        srt_tools, "_try_entry_identity", identity_then_swap_public_stale
+    )
+
+    exit_code = srt_tools.chunk_subtitles(input_path, 1, chunks_dir)
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert injected["stale"] is not None
+    assert injected["stale"].read_bytes() == competitor_payload
+    archives = list(chunks_dir.glob(".srt-safety-archive-*"))
+    assert len(archives) == 1
+    assert old_translation in _regular_file_payloads(archives[0])
+    assert str(archives[0]) in captured.err
+    assert "旧版译文只完成了部分隔离" in captured.err
+    assert manifest_path.read_bytes() == manifest_before
 
 
 def test_chunk_legacy_resume_isolates_every_zh_and_marks_all_for_retranslation(
@@ -895,6 +1019,13 @@ def test_chunk_legacy_resume_isolates_every_zh_and_marks_all_for_retranslation(
     assert (chunks_dir / "chunk_002.stale-legacy.txt").read_text(
         encoding="utf-8"
     ) == legacy_contents["chunk_002.zh.txt"]
+    archives = list(chunks_dir.glob(".srt-safety-archive-*"))
+    assert len(archives) == 1
+    assert set(_regular_file_payloads(archives[0])) == {
+        content.encode("utf-8") for content in legacy_contents.values()
+    }
+    assert str(archives[0]) in result.stderr
+    assert "私有安全归档" in result.stderr
 
 
 @pytest.mark.parametrize("legacy_kind", ["symlink", "directory"])
@@ -943,6 +1074,7 @@ def test_chunk_legacy_resume_rejects_non_regular_entry_without_following_it(
     assert not list(chunks_dir.glob("chunk_*.stale-legacy*.txt"))
     assert not (chunks_dir / "chunk_000.translated.txt").exists()
     assert not list(chunks_dir.glob(".srt-recovery-*"))
+    assert not list(chunks_dir.glob(".srt-safety-archive-*"))
 
 
 def test_chunk_legacy_isolation_failure_preserves_old_translation(
@@ -994,7 +1126,6 @@ def test_chunk_second_legacy_isolation_failure_rolls_back_every_entry(
         ).read_bytes()
         for chunk in manifest["chunks"]
     }
-    entries_before = set(chunks_dir.iterdir())
     second_legacy = chunks_dir / "chunk_001.zh.txt"
     real_link = os.link
 
@@ -1009,7 +1140,8 @@ def test_chunk_second_legacy_isolation_failure_rolls_back_every_entry(
 
     captured = capsys.readouterr()
     assert exit_code == 1
-    assert "无法隔离旧版译文" in captured.err
+    assert "旧版译文只完成了部分隔离" in captured.err
+    assert "安全归档" in captured.err
     assert "secret" not in captured.err
     assert manifest_path.read_bytes() == manifest_before
     assert {
@@ -1018,10 +1150,15 @@ def test_chunk_second_legacy_isolation_failure_rolls_back_every_entry(
     assert {
         path: path.read_bytes() for path in legacy_before
     } == legacy_before
-    assert set(chunks_dir.iterdir()) == entries_before
     assert not list(chunks_dir.glob("chunk_*.stale-legacy*.txt"))
     assert not list(chunks_dir.glob("chunk_*.translated.txt"))
     assert not list(chunks_dir.glob(".*.tmp"))
+    archives = list(chunks_dir.glob(".srt-safety-archive-*"))
+    assert len(archives) == 1
+    assert next(iter(legacy_before.values())) in _regular_file_payloads(
+        archives[0]
+    )
+    assert str(archives[0]) in captured.err
 
 
 def test_chunk_legacy_rollback_failure_reports_partial_state_and_stops_writes(
@@ -1050,12 +1187,12 @@ def test_chunk_legacy_rollback_failure_reports_partial_state_and_stops_writes(
         target = Path(target)
         if (
             source == second_legacy
-            and target.parent.name.startswith(".srt-recovery-")
+            and target.parent.name.startswith(".srt-safety-archive-")
         ):
             raise OSError("secret second isolation failure")
         if (
             source == first_stale
-            and target.parent.name.startswith(".srt-recovery-")
+            and target.parent.name.startswith(".srt-safety-archive-")
         ):
             raise OSError("secret rollback failure")
         return real_replace(source, target, *args, **kwargs)
@@ -1149,6 +1286,70 @@ def test_chunk_legacy_rollback_race_preserves_competitor_and_recovery(
         assert first_legacy.read_bytes() == first_old
         assert competitor_payload in _regular_file_payloads(chunks_dir)
     assert not list(chunks_dir.glob("chunk_*.translated.txt"))
+
+
+def test_chunk_legacy_rollback_source_swap_after_validation_keeps_recovery(
+    tmp_path, monkeypatch, capsys
+):
+    srt_tools = _load_srt_tools()
+    chunks_dir = _chunk_sample(tmp_path)
+    _write_translations(chunks_dir)
+    manifest = _convert_to_legacy_manifest(chunks_dir)
+    manifest_path = chunks_dir / "manifest.json"
+    manifest_before = manifest_path.read_bytes()
+    source_before = {
+        chunks_dir / chunk["source_file"]: (
+            chunks_dir / chunk["source_file"]
+        ).read_bytes()
+        for chunk in manifest["chunks"]
+    }
+    first_legacy = chunks_dir / "chunk_000.zh.txt"
+    old_translation = first_legacy.read_bytes()
+    second_legacy = chunks_dir / "chunk_001.zh.txt"
+    competitor_payload = b"COMPETING_ROLLBACK_SOURCE\n"
+    competitor = tmp_path / "competitor.tmp"
+    competitor.write_bytes(competitor_payload)
+    real_link = os.link
+    real_replace = os.replace
+    real_identity = srt_tools._try_entry_identity
+    state = {"source_checks": 0, "swapped": False}
+
+    def fail_second_stale_link(source, target, *args, **kwargs):
+        if Path(source) == second_legacy and "stale-legacy" in Path(target).name:
+            raise OSError(errno.EIO, "secret second isolation failure")
+        return real_link(source, target, *args, **kwargs)
+
+    def identity_then_swap_restored_source(path):
+        path = Path(path)
+        identity = real_identity(path)
+        if path == first_legacy:
+            state["source_checks"] += 1
+            if state["source_checks"] == 2:
+                assert identity is not None
+                real_replace(competitor, first_legacy)
+                state["swapped"] = True
+        return identity
+
+    monkeypatch.setattr(os, "link", fail_second_stale_link)
+    monkeypatch.setattr(
+        srt_tools, "_try_entry_identity", identity_then_swap_restored_source
+    )
+
+    exit_code = srt_tools.chunk_subtitles(SAMPLE, 2, chunks_dir)
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert state["swapped"] is True
+    assert first_legacy.read_bytes() == competitor_payload
+    archives = list(chunks_dir.glob(".srt-safety-archive-*"))
+    assert len(archives) == 1
+    assert old_translation in _regular_file_payloads(archives[0])
+    assert str(archives[0]) in captured.err
+    assert "旧版译文只完成了部分隔离" in captured.err
+    assert manifest_path.read_bytes() == manifest_before
+    assert {
+        path: path.read_bytes() for path in source_before
+    } == source_before
 
 
 def test_merge_rejects_source_with_different_cue_count(tmp_path):

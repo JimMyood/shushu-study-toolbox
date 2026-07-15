@@ -64,11 +64,16 @@ python scripts/srt_tools.py chunk "$SOURCE_SRT" --size 40 --out-dir "$CHUNKS_DIR
 - 重跑 chunk 会刷新源文本和 manifest。源文未变时保留已有译文；某一块源文变化
   时，只把该块旧译文改名保留为 `chunk_NNN.stale-<hash>.txt`，等待重翻。
 - stale 名称使用原子“不覆盖”占位；若同名文件在并发窗口出现，竞争文件保持原样，
-  工具自动改用 `-2`、`-3`。隔离过程中若路径换包，命令停止且不更新清单，未知
-  文件保存在提示的随机私有恢复目录中，必须人工核对。
+  工具自动改用 `-2`、`-3`。每个成功隔离的旧译文还会在命令打印的
+  `.srt-safety-archive-*` 中保留一个私有硬链接归档；这是正常成功产物和公开 stale
+  的并发保护载体，不代表命令失败，也不是可以自动清理的临时目录。
+- 工具会在提交前复核公开 stale。隔离过程中若路径换包，命令停止且不更新清单；
+  竞争文件保持原样，旧译文仍可从提示的私有安全归档恢复，必须人工核对。安全归档
+  与公开 stale 指向同一文件内容，不要原地编辑任一方；如需修改，先复制到新文件。
 - 上一版 manifest 没有 hash，无法证明 `.zh.txt` 与哪版源文绑定；重跑时会把所有
   旧译文条目以整批事务隔离为 `chunk_NNN.stale-legacy[-N].txt`，全部标记待重翻。
-  任一条目失败会逆序恢复已经移动的条目；即使源文看似未变也不得自动复用。
+  任一条目失败会逆序恢复已经移动的条目，并保留私有安全归档防止 rollback 最后
+  校验后的并发换包；即使源文看似未变也不得自动复用。
 
 4. 对每个 `chunk_NNN.txt` 生成同名 `chunk_NNN.translated.txt`。
 
@@ -127,6 +132,8 @@ python scripts/srt_tools.py validate "$ITEM_DIR/subs.bi.srt"
 - 源分块：`<ITEM_DIR>/translation-chunks/chunk_NNN.txt`
 - 译文分块：`<ITEM_DIR>/translation-chunks/chunk_NNN.translated.txt`
 - 被隔离旧译文：`<ITEM_DIR>/translation-chunks/chunk_NNN.stale-<hash>.txt`
+- 旧译文私有安全归档：
+  `<ITEM_DIR>/translation-chunks/.srt-safety-archive-*/*.preserved`
 - 最终双语字幕：`<ITEM_DIR>/subs.bi.srt`
 
 ## 常见故障
@@ -135,17 +142,19 @@ python scripts/srt_tools.py validate "$ITEM_DIR/subs.bi.srt"
   `needs_translation` 补译。不要手改 hash。
 - `缺少第 N 块译文`：只补对应 `.translated.txt`，不要整批重翻。
 - 出现 `stale-<hash>.txt`：源文已改变；旧译文已保留但不会参与合并，重翻正式
-  `.translated.txt` 后继续。
+  `.translated.txt` 后继续。命令同时打印私有安全归档路径；它是防止公开 stale 被
+  并发替换后丢失旧译文的长期保护载体，请勿写入、移动或自动删除。
 - 旧版 `manifest.json` 与 `.zh.txt`：禁止直接合并，因为没有 hash 就无法证明译文
   对应当前源文。重新运行 chunk；普通文件会进入整批事务隔离，随后重翻全部正式
   `.translated.txt`。符号链接或目录会被明确拒绝并原样保留，不跟随、不搬动；先
   人工移走这些路径条目再重试。
-- `无法隔离旧版译文`：整批隔离已回滚，manifest、源分块和旧 `.zh.txt` 保持原样；
-  修复目录权限后重试。
+- `无法隔离旧版译文`：隔离在建立首个 stale 前失败，manifest、源分块和旧
+  `.zh.txt` 保持原样；修复目录权限后重试。
 - `旧版译文只完成了部分隔离`：隔离失败且自动回滚也受阻；manifest 与源分块仍未
-  更新。不要继续翻译或合并；逐项核对 `.zh.txt`、`stale-legacy` 与提示的
-  `.srt-recovery-*` 恢复目录。竞争文件不得删除或覆盖；确认内容归属、修复权限后再
-  运行 chunk。
+  更新；可见旧译文路径已尽力回滚，私有归档会保留以消除 rollback 的末次清理
+  竞态。不要继续翻译或合并；逐项核对 `.zh.txt`、`stale-legacy` 与提示的
+  `.srt-safety-archive-*`。竞争文件不得删除或覆盖；确认内容归属、修复权限后再运行
+  chunk。
 - `行数不符`：一条原文对应一行译文，删除多余换行或补回缺行。
 - `译文为空`：补译该行；空白占位不算有效翻译。
 - 时间轴警告：翻译不应改时间码；检查是否使用了正确的原文 SRT。
