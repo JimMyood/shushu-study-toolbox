@@ -162,8 +162,12 @@ def _render_segments(segments) -> str:
             content = text.strip()
             if not content:
                 continue
-            start = float(segment.start)
-            end = float(segment.end)
+            raw_start = segment.start
+            raw_end = segment.end
+            if isinstance(raw_start, bool) or isinstance(raw_end, bool):
+                raise InvalidTranscriptionError
+            start = float(raw_start)
+            end = float(raw_end)
             if (
                 not math.isfinite(start)
                 or not math.isfinite(end)
@@ -193,9 +197,27 @@ def _render_segments(segments) -> str:
         )
 
     try:
-        return srt.compose(subtitles, reindex=False)
+        rendered = srt.compose(subtitles, reindex=False)
+        round_tripped = list(srt.parse(rendered))
     except Exception:
         raise InvalidTranscriptionError from None
+
+    if len(round_tripped) != len(subtitles):
+        raise InvalidTranscriptionError
+    previous_rendered_start = None
+    for expected, actual in zip(subtitles, round_tripped):
+        if (
+            actual.index != expected.index
+            or actual.content != expected.content
+            or actual.end <= actual.start
+            or (
+                previous_rendered_start is not None
+                and actual.start < previous_rendered_start
+            )
+        ):
+            raise InvalidTranscriptionError
+        previous_rendered_start = actual.start
+    return rendered
 
 
 def _build_parser() -> argparse.ArgumentParser:

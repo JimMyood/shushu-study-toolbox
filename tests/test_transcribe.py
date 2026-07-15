@@ -425,12 +425,16 @@ def test_blank_segments_are_filtered_and_indices_are_contiguous(
     [
         SimpleNamespace(start=0.0, end=1.0, text=None),
         SimpleNamespace(start=0.0, end=1.0, text=123),
+        SimpleNamespace(start=True, end=2.0, text="text"),
+        SimpleNamespace(start=0.0, end=True, text="text"),
         SimpleNamespace(start="nope", end=1.0, text="text"),
         SimpleNamespace(start=float("nan"), end=1.0, text="text"),
         SimpleNamespace(start=0.0, end=float("inf"), text="text"),
         SimpleNamespace(start=-0.1, end=1.0, text="text"),
         SimpleNamespace(start=1.0, end=1.0, text="text"),
         SimpleNamespace(start=2.0, end=1.0, text="text"),
+        SimpleNamespace(start=0.0001, end=0.0002, text="text"),
+        SimpleNamespace(start=0.0010, end=0.0011, text="text"),
     ],
 )
 def test_invalid_segment_fails_without_replacing_old_output_or_leaking_detail(
