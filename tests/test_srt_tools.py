@@ -776,6 +776,106 @@ def test_chunk_legacy_isolation_failure_preserves_old_translation(
     assert not (chunks_dir / "chunk_000.translated.txt").exists()
 
 
+def test_chunk_second_legacy_isolation_failure_rolls_back_every_entry(
+    tmp_path, monkeypatch, capsys
+):
+    srt_tools = _load_srt_tools()
+    chunks_dir = _chunk_sample(tmp_path)
+    _write_translations(chunks_dir)
+    manifest = _convert_to_legacy_manifest(chunks_dir)
+    manifest_path = chunks_dir / "manifest.json"
+    manifest_before = manifest_path.read_bytes()
+    source_before = {
+        chunks_dir / chunk["source_file"]: (
+            chunks_dir / chunk["source_file"]
+        ).read_bytes()
+        for chunk in manifest["chunks"]
+    }
+    legacy_before = {
+        chunks_dir / chunk["translation_file"]: (
+            chunks_dir / chunk["translation_file"]
+        ).read_bytes()
+        for chunk in manifest["chunks"]
+    }
+    entries_before = set(chunks_dir.iterdir())
+    second_legacy = chunks_dir / "chunk_001.zh.txt"
+    real_replace = Path.replace
+
+    def fail_second_isolation(path, target):
+        if path == second_legacy and "stale-legacy" in Path(target).name:
+            raise OSError("secret second isolation failure")
+        return real_replace(path, target)
+
+    monkeypatch.setattr(Path, "replace", fail_second_isolation)
+
+    exit_code = srt_tools.chunk_subtitles(SAMPLE, 2, chunks_dir)
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert "无法隔离旧版译文" in captured.err
+    assert "secret" not in captured.err
+    assert manifest_path.read_bytes() == manifest_before
+    assert {
+        path: path.read_bytes() for path in source_before
+    } == source_before
+    assert {
+        path: path.read_bytes() for path in legacy_before
+    } == legacy_before
+    assert set(chunks_dir.iterdir()) == entries_before
+    assert not list(chunks_dir.glob("chunk_*.stale-legacy*.txt"))
+    assert not list(chunks_dir.glob("chunk_*.translated.txt"))
+    assert not list(chunks_dir.glob(".*.tmp"))
+
+
+def test_chunk_legacy_rollback_failure_reports_partial_state_and_stops_writes(
+    tmp_path, monkeypatch, capsys
+):
+    srt_tools = _load_srt_tools()
+    chunks_dir = _chunk_sample(tmp_path)
+    _write_translations(chunks_dir)
+    manifest = _convert_to_legacy_manifest(chunks_dir)
+    manifest_path = chunks_dir / "manifest.json"
+    manifest_before = manifest_path.read_bytes()
+    source_before = {
+        chunks_dir / chunk["source_file"]: (
+            chunks_dir / chunk["source_file"]
+        ).read_bytes()
+        for chunk in manifest["chunks"]
+    }
+    first_legacy = chunks_dir / "chunk_000.zh.txt"
+    first_stale = chunks_dir / "chunk_000.stale-legacy.txt"
+    first_content = first_legacy.read_bytes()
+    second_legacy = chunks_dir / "chunk_001.zh.txt"
+    real_replace = Path.replace
+
+    def fail_isolation_and_rollback(path, target):
+        if path == second_legacy and "stale-legacy" in Path(target).name:
+            raise OSError("secret second isolation failure")
+        if path == first_stale and Path(target) == first_legacy:
+            raise OSError("secret rollback failure")
+        return real_replace(path, target)
+
+    monkeypatch.setattr(Path, "replace", fail_isolation_and_rollback)
+
+    exit_code = srt_tools.chunk_subtitles(SAMPLE, 2, chunks_dir)
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert "旧版译文只完成了部分隔离" in captured.err
+    assert "手动恢复" in captured.err
+    assert "secret" not in captured.err
+    assert manifest_path.read_bytes() == manifest_before
+    assert {
+        path: path.read_bytes() for path in source_before
+    } == source_before
+    assert not first_legacy.exists()
+    assert first_stale.read_bytes() == first_content
+    assert second_legacy.is_file()
+    assert (chunks_dir / "chunk_002.zh.txt").is_file()
+    assert not list(chunks_dir.glob("chunk_*.translated.txt"))
+    assert not list(chunks_dir.glob(".*.tmp"))
+
+
 def test_merge_rejects_source_with_different_cue_count(tmp_path):
     chunks_dir = _chunk_sample(tmp_path)
     _write_translations(chunks_dir)

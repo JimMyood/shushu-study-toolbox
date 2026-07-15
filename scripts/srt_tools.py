@@ -14,6 +14,10 @@ import srt
 class LegacyIsolationError(Exception):
     """旧版译文条目无法安全隔离。"""
 
+    def __init__(self, *, partial_state: bool = False):
+        super().__init__()
+        self.partial_state = partial_state
+
 
 def _read_subtitles(path: Path) -> list[srt.Subtitle]:
     return list(srt.parse(path.read_text(encoding="utf-8")))
@@ -298,15 +302,77 @@ def _isolate_legacy_translations(out_dir: Path) -> None:
             ),
             key=lambda path: path.name,
         )
+        plans = [
+            (
+                legacy_path,
+                _next_legacy_stale_path(legacy_path),
+                legacy_path.lstat(),
+            )
+            for legacy_path in legacy_paths
+        ]
     except OSError as error:
         raise LegacyIsolationError from error
 
-    for legacy_path in legacy_paths:
-        stale_path = _next_legacy_stale_path(legacy_path)
-        try:
-            legacy_path.replace(stale_path)
-        except OSError as error:
-            raise LegacyIsolationError from error
+    moved: list[tuple[Path, Path, tuple[int, int, int]]] = []
+    try:
+        for legacy_path, stale_path, original_stat in plans:
+            current_stat = legacy_path.lstat()
+            identity = (
+                original_stat.st_dev,
+                original_stat.st_ino,
+                original_stat.st_mode,
+            )
+            current_identity = (
+                current_stat.st_dev,
+                current_stat.st_ino,
+                current_stat.st_mode,
+            )
+            if current_identity != identity:
+                raise OSError("legacy path changed during isolation")
+            if stale_path.exists() or stale_path.is_symlink():
+                raise OSError("legacy stale destination appeared")
+            try:
+                legacy_path.replace(stale_path)
+            except OSError:
+                try:
+                    moved_stat = stale_path.lstat()
+                except OSError:
+                    moved_stat = None
+                if (
+                    moved_stat is not None
+                    and not legacy_path.exists()
+                    and not legacy_path.is_symlink()
+                    and (
+                        moved_stat.st_dev,
+                        moved_stat.st_ino,
+                        moved_stat.st_mode,
+                    )
+                    == identity
+                ):
+                    moved.append((legacy_path, stale_path, identity))
+                raise
+            moved.append((legacy_path, stale_path, identity))
+    except OSError as error:
+        rollback_failed = False
+        for legacy_path, stale_path, identity in reversed(moved):
+            try:
+                if legacy_path.exists() or legacy_path.is_symlink():
+                    rollback_failed = True
+                    continue
+                stale_stat = stale_path.lstat()
+                if (
+                    stale_stat.st_dev,
+                    stale_stat.st_ino,
+                    stale_stat.st_mode,
+                ) != identity:
+                    rollback_failed = True
+                    continue
+                stale_path.replace(legacy_path)
+            except OSError:
+                rollback_failed = True
+        raise LegacyIsolationError(partial_state=rollback_failed) from error
+
+    for _legacy_path, stale_path, _identity in moved:
         print(
             f"旧版译文无法验证，已隔离为 {stale_path.name}；"
             "请按当前源文重翻该块",
@@ -329,12 +395,20 @@ def chunk_subtitles(input_path: Path, size: int, out_dir: Path) -> int:
         ):
             try:
                 _isolate_legacy_translations(out_dir)
-            except LegacyIsolationError:
-                print(
-                    f"无法隔离旧版译文：{out_dir}。"
-                    "请检查目录权限后重试；原译文不会被自动复用",
-                    file=sys.stderr,
-                )
+            except LegacyIsolationError as error:
+                if error.partial_state:
+                    print(
+                        "旧版译文只完成了部分隔离，清单与源分块尚未更新；"
+                        "请手动恢复 stale-legacy 与 .zh.txt 后重试。"
+                        "原译文不会被自动复用",
+                        file=sys.stderr,
+                    )
+                else:
+                    print(
+                        f"无法隔离旧版译文：{out_dir}。"
+                        "请检查目录权限后重试；原译文不会被自动复用",
+                        file=sys.stderr,
+                    )
                 return 1
         chunks = []
 

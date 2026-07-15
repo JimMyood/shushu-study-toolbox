@@ -52,8 +52,8 @@ python scripts/srt_tools.py chunk "$SOURCE_SRT" --size 40 --out-dir "$CHUNKS_DIR
 - 重跑 chunk 会刷新源文本和 manifest。源文未变时保留已有译文；某一块源文变化
   时，只把该块旧译文改名保留为 `chunk_NNN.stale-<hash>.txt`，等待重翻。
 - 上一版 manifest 没有 hash，无法证明 `.zh.txt` 与哪版源文绑定；重跑时会把所有
-  旧译文条目原子隔离为 `chunk_NNN.stale-legacy[-N].txt`，全部标记待重翻。即使
-  源文看似未变也不得自动复用。
+  旧译文条目以整批事务隔离为 `chunk_NNN.stale-legacy[-N].txt`，全部标记待重翻。
+  任一条目失败会逆序恢复已经移动的条目；即使源文看似未变也不得自动复用。
 
 4. 对每个 `chunk_NNN.txt` 生成同名 `chunk_NNN.translated.txt`。
 
@@ -125,6 +125,11 @@ python scripts/srt_tools.py validate "$ITEM_DIR/subs.bi.srt"
   对应当前源文。重新运行 chunk；工具会把每个旧 `.zh.txt` 路径条目（包括符号链接
   或目录）整体改名隔离，不读取链接目标或目录内容。随后重翻全部正式
   `.translated.txt`。
+- `无法隔离旧版译文`：整批隔离已回滚，manifest、源分块和旧 `.zh.txt` 保持原样；
+  修复目录权限后重试。
+- `旧版译文只完成了部分隔离`：隔离失败且自动回滚也受阻；manifest 与源分块仍未
+  更新。不要继续翻译或合并；逐项核对 `.zh.txt` 与 `stale-legacy`，仅在原 `.zh.txt`
+  缺失时把对应 stale 条目改回原名，修复权限后再运行 chunk。
 - `行数不符`：一条原文对应一行译文，删除多余换行或补回缺行。
 - `译文为空`：补译该行；空白占位不算有效翻译。
 - 时间轴警告：翻译不应改时间码；检查是否使用了正确的原文 SRT。
