@@ -5,6 +5,8 @@ from datetime import datetime
 import json
 import math
 from pathlib import Path
+import re
+import ssl
 import sys
 import tempfile
 from typing import Callable, Sequence
@@ -13,6 +15,18 @@ import yt_dlp
 
 
 YdlFactory = Callable[[dict], object]
+
+_NETWORK_ERROR_MARKERS = (
+    "unable to download webpage",
+    "unable to download api page",
+    "timed out",
+    "connection reset",
+    "network is unreachable",
+    "temporary failure in name resolution",
+    "name or service not known",
+    "certificate_verify_failed",
+    "certificate verify failed",
+)
 
 
 class FetchError(Exception):
@@ -62,15 +76,10 @@ def build_opts(mode: str, quality: str | None, out_dir: Path) -> dict:
         return {
             "format": (
                 f"bestvideo[height<={height}][ext=mp4]+bestaudio[ext=m4a]/"
-                f"best[height<={height}][ext=mp4]/"
-                f"bestvideo[height<={height}]+bestaudio/"
-                f"best[height<={height}]"
+                f"best[height<={height}][ext=mp4]"
             ),
             "outtmpl": str(output_dir / "video.%(ext)s"),
             "merge_output_format": "mp4",
-            "postprocessors": [
-                {"key": "FFmpegVideoConvertor", "preferedformat": "mp4"}
-            ],
         }
     if mode == "audio":
         return {
@@ -99,6 +108,11 @@ def build_opts(mode: str, quality: str | None, out_dir: Path) -> dict:
 def classify_error(error: Exception) -> str:
     """把 yt-dlp 异常归类为不泄露内部堆栈的人话提示。"""
     message = str(error).lower()
+    if "requested format is not available" in message:
+        return (
+            "没有兼容 MP4 格式可供下载，所选清晰度可能只提供其他容器。"
+            "请降低 --quality 后重试，或换一个提供 MP4 的公开链接。"
+        )
     if any(
         marker in message
         for marker in (
@@ -117,31 +131,32 @@ def classify_error(error: Exception) -> str:
         for marker in (
             "not available in your country",
             "not available in your region",
+            "not available from your location",
             "geo-restricted",
             "geo restricted",
+            "geo restriction",
             "geographic restriction",
+            "uploader has not made this video available",
         )
     ):
         return (
             "该内容受地区限制，当前网络所在地区无法访问。"
             "请在内容允许的地区重试，或换一个可访问的链接。"
         )
-    if any(
-        marker in message
-        for marker in (
-            "unable to download webpage",
-            "timed out",
-            "connection reset",
-            "network is unreachable",
-            "temporary failure in name resolution",
-            "name or service not known",
-        )
-    ):
+    if _is_network_error(error):
         return (
             "网络连接失败，暂时无法访问视频站点。"
             "请检查网络连接后重试。"
         )
     return "下载失败。请确认链接有效且公开，然后重试。"
+
+
+def _is_network_error(error: Exception) -> bool:
+    return isinstance(
+        error, (TimeoutError, ConnectionError, ssl.SSLError)
+    ) or any(
+        marker in str(error).lower() for marker in _NETWORK_ERROR_MARKERS
+    )
 
 
 def _usable_languages(info: dict, field: str) -> list[str]:
@@ -315,31 +330,40 @@ def _download_subtitles(
     factory: YdlFactory,
 ) -> Path:
     destination = _make_output_dir(out_dir)
-    inspection_options = build_opts("subs", None, destination)
-    info = _extract_info(
-        factory, inspection_options, url, download=False
-    )
-    selected = select_subtitle(info, language)
-    if selected is None:
-        raise SubtitleUnavailable(
-            language, available_subtitle_languages(info)
-        )
-
-    selected_language, source = selected
     with tempfile.TemporaryDirectory(
         prefix=".fetch-", dir=destination
     ) as temporary_name:
         temporary_dir = Path(temporary_name)
         options = build_opts("subs", None, temporary_dir)
-        options.update(
-            {
-                "writesubtitles": source == "official",
-                "writeautomaticsub": source == "automatic",
-                "subtitleslangs": [selected_language],
-            }
+        with factory(_runtime_opts(options)) as downloader:
+            info = downloader.extract_info(
+                url, download=False, process=False
+            )
+            if not isinstance(info, dict):
+                raise FetchError(
+                    "视频站点没有返回有效信息。请更新 yt-dlp 后重试。"
+                )
+            selected = select_subtitle(info, language)
+            if selected is None:
+                raise SubtitleUnavailable(
+                    language, available_subtitle_languages(info)
+                )
+
+            selected_language, source = selected
+            downloader.params.update(
+                {
+                    "writesubtitles": source == "official",
+                    "writeautomaticsub": source == "automatic",
+                    "subtitleslangs": [re.escape(selected_language)],
+                }
+            )
+            downloader.process_ie_result(info, download=True)
+
+        candidates = sorted(
+            path
+            for path in temporary_dir.rglob("*.srt")
+            if path.is_file() and not path.is_symlink()
         )
-        _extract_info(factory, options, url, download=True)
-        candidates = sorted(temporary_dir.rglob("*.srt"))
         if len(candidates) != 1:
             raise FetchError(
                 "字幕下载已结束，但没有生成唯一的 SRT 文件。"
@@ -418,12 +442,15 @@ def main(
     except FetchError as error:
         print(str(error), file=sys.stderr)
         return 1
-    except OSError:
-        print(
-            f"无法写入输出目录：{args.out}。"
-            "请检查路径是否存在冲突以及当前用户是否有写入权限。",
-            file=sys.stderr,
-        )
+    except OSError as error:
+        if _is_network_error(error):
+            print(classify_error(error), file=sys.stderr)
+        else:
+            print(
+                f"无法写入输出目录：{args.out}。"
+                "请检查路径是否存在冲突以及当前用户是否有写入权限。",
+                file=sys.stderr,
+            )
         return 1
     except Exception as error:
         print(classify_error(error), file=sys.stderr)
