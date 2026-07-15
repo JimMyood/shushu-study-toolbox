@@ -1,9 +1,12 @@
 """SRT 字幕分块、双语合并与时间轴校验工具。"""
 
 import argparse
+import errno
 import hashlib
 import json
+import os
 from pathlib import Path
+import stat
 import sys
 import tempfile
 from typing import Sequence
@@ -14,9 +17,31 @@ import srt
 class LegacyIsolationError(Exception):
     """旧版译文条目无法安全隔离。"""
 
-    def __init__(self, *, partial_state: bool = False):
+    def __init__(
+        self,
+        *,
+        partial_state: bool = False,
+        recovery_dir: Path | None = None,
+        unsafe_entry: bool = False,
+    ):
         super().__init__()
         self.partial_state = partial_state
+        self.recovery_dir = recovery_dir
+        self.unsafe_entry = unsafe_entry
+
+
+class StaleIsolationError(Exception):
+    """新版译文无法安全隔离。"""
+
+    def __init__(
+        self,
+        *,
+        reason: str,
+        recovery_dir: Path | None = None,
+    ):
+        super().__init__()
+        self.reason = reason
+        self.recovery_dir = recovery_dir
 
 
 def _read_subtitles(path: Path) -> list[srt.Subtitle]:
@@ -256,18 +281,275 @@ def _previous_chunk_binding(
     return recorded_hash, chunks_dir / expected_translation
 
 
-def _next_stale_path(
-    chunks_dir: Path, number: int, source_hash: str | None
-) -> Path:
-    hash_label = source_hash[:12] if _is_sha256(source_hash) else "unknown"
-    candidate = chunks_dir / f"chunk_{number:03d}.stale-{hash_label}.txt"
-    counter = 2
-    while candidate.exists() or candidate.is_symlink():
-        candidate = chunks_dir / (
-            f"chunk_{number:03d}.stale-{hash_label}-{counter}.txt"
+def _entry_identity(path: Path) -> tuple[int, int, int]:
+    entry_stat = path.lstat()
+    return (entry_stat.st_dev, entry_stat.st_ino, entry_stat.st_mode)
+
+
+def _try_entry_identity(path: Path) -> tuple[int, int, int] | None:
+    try:
+        return _entry_identity(path)
+    except OSError:
+        return None
+
+
+def _create_recovery_dir(out_dir: Path) -> Path:
+    recovery_dir = Path(
+        tempfile.mkdtemp(prefix=".srt-recovery-", dir=out_dir)
+    )
+    recovery_dir.chmod(0o700)
+    return recovery_dir
+
+
+def _create_owned_placeholder(
+    recovery_dir: Path, label: str
+) -> tuple[Path, tuple[int, int, int]]:
+    descriptor, raw_path = tempfile.mkstemp(
+        prefix=f".{label}.", suffix=".park", dir=recovery_dir
+    )
+    try:
+        if hasattr(os, "fchmod"):
+            os.fchmod(descriptor, 0o600)
+        entry_stat = os.fstat(descriptor)
+        identity = (entry_stat.st_dev, entry_stat.st_ino, entry_stat.st_mode)
+    finally:
+        os.close(descriptor)
+    return Path(raw_path), identity
+
+
+def _remove_private_entry(
+    path: Path, expected_identity: tuple[int, int, int]
+) -> bool:
+    try:
+        if _entry_identity(path) != expected_identity:
+            return False
+        os.unlink(path)
+    except OSError:
+        return False
+    return True
+
+
+def _park_entry(
+    source: Path, recovery_dir: Path
+) -> tuple[Path, tuple[int, int, int]]:
+    park_path, placeholder_identity = _create_owned_placeholder(
+        recovery_dir, source.name
+    )
+    try:
+        os.replace(source, park_path)
+    except OSError:
+        _remove_private_entry(park_path, placeholder_identity)
+        raise
+    return park_path, _entry_identity(park_path)
+
+
+def _stale_candidate(source: Path, base_name: str, attempt: int) -> Path:
+    suffix = "" if attempt == 1 else f"-{attempt}"
+    return source.with_name(f"{base_name}{suffix}.txt")
+
+
+def _link_unique_stale(
+    source: Path,
+    base_name: str,
+) -> tuple[Path, tuple[int, int, int]]:
+    attempt = 1
+    while True:
+        candidate = _stale_candidate(source, base_name, attempt)
+        try:
+            os.link(source, candidate, follow_symlinks=False)
+        except OSError as error:
+            if error.errno == errno.EEXIST:
+                attempt += 1
+                continue
+            raise
+        return candidate, _entry_identity(candidate)
+
+
+def _rollback_isolations(
+    records: list[dict[str, object]], recovery_dir: Path
+) -> tuple[bool, Path | None]:
+    partial_state = False
+
+    for record in records:
+        source = record["source"]
+        expected = record["identity"]
+        assert isinstance(source, Path) and isinstance(expected, tuple)
+        current_identity = _try_entry_identity(source)
+        if current_identity is None:
+            carriers = [record["stale"]]
+            carriers.extend(
+                park_path for park_path, _identity in record["parks"]
+            )
+            for carrier in carriers:
+                assert isinstance(carrier, Path)
+                if _try_entry_identity(carrier) != expected:
+                    continue
+                try:
+                    os.link(carrier, source, follow_symlinks=False)
+                except OSError as error:
+                    if error.errno != errno.EEXIST:
+                        partial_state = True
+                break
+            current_identity = _try_entry_identity(source)
+        restored = current_identity == expected
+        record["restored"] = restored
+        if not restored:
+            partial_state = True
+
+    for record in reversed(records):
+        source = record["source"]
+        stale_path = record["stale"]
+        expected = record["identity"]
+        restored = record.get("restored") is True
+        assert (
+            isinstance(source, Path)
+            and isinstance(stale_path, Path)
+            and isinstance(expected, tuple)
         )
-        counter += 1
-    return candidate
+        stale_identity = _try_entry_identity(stale_path)
+        if stale_identity is None:
+            continue
+        if not restored and stale_identity == expected:
+            partial_state = True
+            continue
+        try:
+            parked_path, parked_identity = _park_entry(
+                stale_path, recovery_dir
+            )
+        except OSError:
+            partial_state = True
+            continue
+        record["parks"].append((parked_path, parked_identity))
+        if parked_identity != expected:
+            partial_state = True
+
+    for record in records:
+        source = record["source"]
+        expected = record["identity"]
+        assert isinstance(source, Path) and isinstance(expected, tuple)
+        restored = _try_entry_identity(source) == expected
+        record["restored"] = restored
+        if not restored:
+            partial_state = True
+
+    for record in records:
+        expected = record["identity"]
+        restored = record.get("restored") is True
+        assert isinstance(expected, tuple)
+        for parked_path, parked_identity in record["parks"]:
+            if parked_identity == expected and restored:
+                if not _remove_private_entry(parked_path, expected):
+                    partial_state = True
+            else:
+                partial_state = True
+
+    try:
+        remaining = list(recovery_dir.iterdir())
+    except OSError:
+        return True, recovery_dir
+    if remaining:
+        return True, recovery_dir
+    try:
+        recovery_dir.rmdir()
+    except OSError:
+        return True, recovery_dir
+    return partial_state, None
+
+
+def _isolate_regular_entries(
+    entries: list[tuple[Path, str]], out_dir: Path
+) -> list[Path]:
+    records: list[dict[str, object]] = []
+    recovery_dir: Path | None = None
+    reason = "operation"
+
+    try:
+        validated = []
+        for source, base_name in entries:
+            source_stat = source.lstat()
+            if source.is_symlink() or not stat.S_ISREG(source_stat.st_mode):
+                raise StaleIsolationError(reason="unsafe")
+            identity = (
+                source_stat.st_dev,
+                source_stat.st_ino,
+                source_stat.st_mode,
+            )
+            validated.append((source, base_name, identity))
+
+        for source, base_name, identity in validated:
+            stale_path, linked_identity = _link_unique_stale(
+                source, base_name
+            )
+            record: dict[str, object] = {
+                "source": source,
+                "stale": stale_path,
+                "identity": identity,
+                "parks": [],
+            }
+            records.append(record)
+            if linked_identity != identity:
+                reason = "stale_changed"
+                raise OSError("stale identity changed")
+
+        if not records:
+            return []
+        recovery_dir = _create_recovery_dir(out_dir)
+        for record in records:
+            source = record["source"]
+            expected = record["identity"]
+            assert isinstance(source, Path) and isinstance(expected, tuple)
+            parked_path, parked_identity = _park_entry(source, recovery_dir)
+            record["parks"].append((parked_path, parked_identity))
+            if parked_identity != expected:
+                reason = "source_changed"
+                raise OSError("source identity changed")
+
+        for record in records:
+            stale_path = record["stale"]
+            expected = record["identity"]
+            assert isinstance(stale_path, Path) and isinstance(expected, tuple)
+            if _try_entry_identity(stale_path) != expected:
+                reason = "stale_changed"
+                raise OSError("stale identity changed")
+
+        for record in records:
+            source = record["source"]
+            assert isinstance(source, Path)
+            if _try_entry_identity(source) is not None:
+                reason = "source_changed"
+                raise OSError("source path reappeared")
+
+        for record in records:
+            expected = record["identity"]
+            assert isinstance(expected, tuple)
+            for parked_path, parked_identity in record["parks"]:
+                if (
+                    parked_identity != expected
+                    or not _remove_private_entry(parked_path, expected)
+                ):
+                    reason = "recovery_changed"
+                    raise OSError("recovery identity changed")
+        recovery_dir.rmdir()
+        return [record["stale"] for record in records]
+    except StaleIsolationError:
+        raise
+    except OSError as error:
+        if records:
+            try:
+                recovery_dir = recovery_dir or _create_recovery_dir(out_dir)
+                partial_state, remaining_recovery = _rollback_isolations(
+                    records, recovery_dir
+                )
+            except OSError:
+                partial_state = True
+                remaining_recovery = recovery_dir
+            if partial_state and reason == "operation":
+                reason = "rollback_changed"
+            raise StaleIsolationError(
+                reason=reason,
+                recovery_dir=remaining_recovery,
+            ) from error
+        raise StaleIsolationError(reason=reason) from error
 
 
 def _is_legacy_translation_name(name: str) -> bool:
@@ -280,18 +562,6 @@ def _is_legacy_translation_name(name: str) -> bool:
     )
 
 
-def _next_legacy_stale_path(legacy_path: Path) -> Path:
-    chunk_name = legacy_path.name[: -len(".zh.txt")]
-    candidate = legacy_path.with_name(f"{chunk_name}.stale-legacy.txt")
-    counter = 2
-    while candidate.exists() or candidate.is_symlink():
-        candidate = legacy_path.with_name(
-            f"{chunk_name}.stale-legacy-{counter}.txt"
-        )
-        counter += 1
-    return candidate
-
-
 def _isolate_legacy_translations(out_dir: Path) -> None:
     try:
         legacy_paths = sorted(
@@ -302,77 +572,29 @@ def _isolate_legacy_translations(out_dir: Path) -> None:
             ),
             key=lambda path: path.name,
         )
-        plans = [
-            (
-                legacy_path,
-                _next_legacy_stale_path(legacy_path),
-                legacy_path.lstat(),
-            )
-            for legacy_path in legacy_paths
-        ]
     except OSError as error:
         raise LegacyIsolationError from error
-
-    moved: list[tuple[Path, Path, tuple[int, int, int]]] = []
     try:
-        for legacy_path, stale_path, original_stat in plans:
-            current_stat = legacy_path.lstat()
-            identity = (
-                original_stat.st_dev,
-                original_stat.st_ino,
-                original_stat.st_mode,
-            )
-            current_identity = (
-                current_stat.st_dev,
-                current_stat.st_ino,
-                current_stat.st_mode,
-            )
-            if current_identity != identity:
-                raise OSError("legacy path changed during isolation")
-            if stale_path.exists() or stale_path.is_symlink():
-                raise OSError("legacy stale destination appeared")
-            try:
-                legacy_path.replace(stale_path)
-            except OSError:
-                try:
-                    moved_stat = stale_path.lstat()
-                except OSError:
-                    moved_stat = None
-                if (
-                    moved_stat is not None
-                    and not legacy_path.exists()
-                    and not legacy_path.is_symlink()
-                    and (
-                        moved_stat.st_dev,
-                        moved_stat.st_ino,
-                        moved_stat.st_mode,
-                    )
-                    == identity
-                ):
-                    moved.append((legacy_path, stale_path, identity))
-                raise
-            moved.append((legacy_path, stale_path, identity))
-    except OSError as error:
-        rollback_failed = False
-        for legacy_path, stale_path, identity in reversed(moved):
-            try:
-                if legacy_path.exists() or legacy_path.is_symlink():
-                    rollback_failed = True
-                    continue
-                stale_stat = stale_path.lstat()
-                if (
-                    stale_stat.st_dev,
-                    stale_stat.st_ino,
-                    stale_stat.st_mode,
-                ) != identity:
-                    rollback_failed = True
-                    continue
-                stale_path.replace(legacy_path)
-            except OSError:
-                rollback_failed = True
-        raise LegacyIsolationError(partial_state=rollback_failed) from error
+        stale_paths = _isolate_regular_entries(
+            [
+                (
+                    legacy_path,
+                    f"{legacy_path.name[:-len('.zh.txt')]}.stale-legacy",
+                )
+                for legacy_path in legacy_paths
+            ],
+            out_dir,
+        )
+    except StaleIsolationError as error:
+        raise LegacyIsolationError(
+            partial_state=error.recovery_dir is not None
+            or error.reason
+            in {"source_changed", "stale_changed", "rollback_changed"},
+            recovery_dir=error.recovery_dir,
+            unsafe_entry=error.reason == "unsafe",
+        ) from error
 
-    for _legacy_path, stale_path, _identity in moved:
+    for stale_path in stale_paths:
         print(
             f"旧版译文无法验证，已隔离为 {stale_path.name}；"
             "请按当前源文重翻该块",
@@ -386,6 +608,12 @@ def chunk_subtitles(input_path: Path, size: int, out_dir: Path) -> int:
     except (OSError, UnicodeError, srt.SRTParseError):
         print(f"无法读取或解析 SRT 文件：{input_path}", file=sys.stderr)
         return 1
+    if not subtitles:
+        print(
+            f"SRT 文件没有字幕条目：{input_path}。不会改动现有分块",
+            file=sys.stderr,
+        )
+        return 1
     try:
         out_dir.mkdir(parents=True, exist_ok=True)
         previous_manifest = _load_manifest(out_dir / "manifest.json")
@@ -396,10 +624,21 @@ def chunk_subtitles(input_path: Path, size: int, out_dir: Path) -> int:
             try:
                 _isolate_legacy_translations(out_dir)
             except LegacyIsolationError as error:
-                if error.partial_state:
+                if error.unsafe_entry:
+                    print(
+                        "旧版译文必须是普通文件；符号链接或目录会保持原样。"
+                        "请移走该路径条目后重试",
+                        file=sys.stderr,
+                    )
+                elif error.partial_state:
+                    recovery_message = (
+                        f"恢复目录：{error.recovery_dir}。"
+                        if error.recovery_dir is not None
+                        else "未能创建恢复目录。"
+                    )
                     print(
                         "旧版译文只完成了部分隔离，清单与源分块尚未更新；"
-                        "请手动恢复 stale-legacy 与 .zh.txt 后重试。"
+                        f"{recovery_message}请手动恢复后重试。"
                         "原译文不会被自动复用",
                         file=sys.stderr,
                     )
@@ -434,8 +673,49 @@ def chunk_subtitles(input_path: Path, size: int, out_dir: Path) -> int:
                 and old_hash == source_hash
             )
             if translation_exists and not safely_reusable:
-                stale_path = _next_stale_path(out_dir, number, old_hash)
-                translation_path.replace(stale_path)
+                hash_label = (
+                    old_hash[:12] if _is_sha256(old_hash) else "unknown"
+                )
+                try:
+                    stale_path = _isolate_regular_entries(
+                        [
+                            (
+                                translation_path,
+                                f"chunk_{number:03d}.stale-{hash_label}",
+                            )
+                        ],
+                        out_dir,
+                    )[0]
+                except StaleIsolationError as error:
+                    if error.reason == "unsafe":
+                        print(
+                            f"第 {number + 1} 块译文必须是普通文件；"
+                            "符号链接或目录会保持原样",
+                            file=sys.stderr,
+                        )
+                    elif error.reason in {
+                        "source_changed",
+                        "stale_changed",
+                        "rollback_changed",
+                        "recovery_changed",
+                    }:
+                        recovery_message = (
+                            f"恢复目录：{error.recovery_dir}。"
+                            if error.recovery_dir is not None
+                            else "未能创建恢复目录。"
+                        )
+                        print(
+                            "译文路径在隔离时发生变化；"
+                            f"{recovery_message}清单与源分块未更新，请人工核对",
+                            file=sys.stderr,
+                        )
+                    else:
+                        print(
+                            f"无法安全隔离第 {number + 1} 块旧译文；"
+                            "清单与源分块未更新，请检查目录权限后重试",
+                            file=sys.stderr,
+                        )
+                    return 1
                 print(
                     f"第 {number + 1} 块源文已改变；旧译文已保留为 "
                     f"{stale_path.name}",
@@ -607,6 +887,12 @@ def validate_subtitles(path: Path) -> int:
         if cue.end < cue.start:
             print(
                 f"第 {position} 条字幕结束时间早于开始时间",
+                file=sys.stderr,
+            )
+            return 1
+        if cue.end == cue.start:
+            print(
+                f"第 {position} 条字幕结束时间必须晚于开始时间",
                 file=sys.stderr,
             )
             return 1
