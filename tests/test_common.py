@@ -350,6 +350,17 @@ def test_workflow_docs_route_real_config_values_through_prepare():
     assert "python3" not in combined
 
 
+def test_download_and_subtitle_reuse_current_pipeline_prepare_json():
+    repo_root = Path(__file__).resolve().parent.parent
+
+    for name in ("download", "subtitle"):
+        manual = (repo_root / "tools" / f"{name}.md").read_text(
+            encoding="utf-8"
+        )
+        assert "本流水线已有 prepare JSON" in manual, name
+        assert "只有独立启动、尚未 prepare 时" in manual, name
+
+
 def test_downstream_manuals_reuse_prepared_item_dir_and_config():
     repo_root = Path(__file__).resolve().parent.parent
     manuals = {
@@ -374,7 +385,9 @@ def test_readme_script_examples_use_prepare_and_config_values():
     readme = (repo_root / "README.md").read_text(encoding="utf-8")
 
     assert "python scripts/common.py prepare" in readme
-    assert '--quality "$VIDEO_QUALITY"' in readme
-    assert '--lang "$SOURCE_LANG"' in readme
+    assert "逐条模板，不是可整段执行的 Shell 脚本" in readme
+    assert '--quality "<video_quality>"' in readme
+    assert '--lang "<source_lang>"' in readme
+    assert '--out "<item_dir>"' in readme
     assert "$HOME/ShushuStudy/example" not in readme
     assert "--quality 1080" not in readme

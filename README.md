@@ -121,16 +121,22 @@ mklink /D "%USERPROFILE%\.claude\skills\shushu-study-toolbox" "%CD%"
 | 树树工具箱 - 生成学习笔记 | “根据这个目录中已校验的双语字幕生成一篇中文为主、关键术语保留英文的学习笔记。” |
 | 树树工具箱 - 精读网页与 PDF | “精读这份 PDF；我要双语摘要，不要全文翻译，并给可核对的引文页码。” |
 
-也可以直接运行机械脚本；真实参数以各工具手册和 `python scripts/<脚本>.py --help` 为准。例如：
+也可以逐条运行机械脚本；真实参数以各工具手册和
+`python scripts/<脚本>.py --help` 为准。下面是逐条模板，不是可整段执行的 Shell 脚本。
+先单独运行 `prepare`，读取它在 stdout 返回的 JSON：
 
 ```bash
-TITLE='素材的真实标题'
-python scripts/common.py prepare --title "$TITLE"
-# 解析上一行 JSON，得到 ITEM_DIR、VIDEO_QUALITY、SOURCE_LANG 等真实配置值
-python scripts/fetch.py video "https://example.com/video" --quality "$VIDEO_QUALITY" --out "$ITEM_DIR"
-python scripts/fetch.py subs "https://example.com/video" --lang "$SOURCE_LANG" --out "$ITEM_DIR"
-python scripts/srt_tools.py validate "$ITEM_DIR/subs.orig.srt"
-python scripts/mux.py soft "$ITEM_DIR/video.mp4" "$ITEM_DIR/subs.bi.srt" --out "$ITEM_DIR/video.soft.mp4"
+python scripts/common.py prepare --title "<真实标题>"
+```
+
+然后把下列尖括号占位符逐个替换为这份 JSON 的真实值，再逐条执行；
+Bash/zsh 与 PowerShell 都采用这种替换方式，不要把占位符当成变量：
+
+```text
+python scripts/fetch.py video "<URL>" --quality "<video_quality>" --out "<item_dir>"
+python scripts/fetch.py subs "<URL>" --lang "<source_lang>" --out "<item_dir>"
+python scripts/srt_tools.py validate "<item_dir>/subs.orig.srt"
+python scripts/mux.py soft "<item_dir>/video.mp4" "<item_dir>/subs.bi.srt" --out "<item_dir>/video.soft.mp4"
 ```
 
 同一流水线只运行一次 `prepare`，后续步骤复用同一个 `ITEM_DIR`。

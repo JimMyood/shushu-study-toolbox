@@ -31,7 +31,11 @@ python scripts/doctor.py
 
 ## 步骤
 
-1. 设置来源链接和真实标题，调用统一配置入口：
+1. 先确定本流水线是否已经取得 `common.py prepare` 的 JSON。
+
+- 本流水线已有 prepare JSON：直接复用其中全部七个字段，跳到第 2 步；
+  不因跨午夜或来源标题变化再次 prepare。
+- 只有独立启动、尚未 prepare 时，才设置来源链接和真实标题并调用统一配置入口：
 
 ```bash
 URL='https://example.com/video'
@@ -109,8 +113,8 @@ python -c 'from pathlib import Path; import sys; p=Path(sys.argv[1]); [print(f"{
 - `没有兼容 MP4 格式`：换公开且提供 MP4 兼容流的来源。
 - `无法写入输出目录`：检查路径、权限、磁盘空间和同名目录冲突。
 - `可恢复资料已保留`：事务自动回滚未完成；暂停重试，按屏幕给出的
-  `.fetch-*` 路径检查 `backups/`、`failed-new/` 和最终槽位。只有屏幕确认
-  `RECOVERY.txt` 写入成功时，才依赖该说明文件。
+  `.fetch-*` 路径检查 `backups/`、`new/`、`failed-new/` 和最终槽位。
+  只有屏幕确认 `RECOVERY.txt` 写入成功时，才依赖该说明文件。
 - `临时目录清理失败`：成品已按命令结果发布，但屏幕列出的 `.fetch-*`
   目录仍残留；核对成品后手动删除该精确路径，不用通配符批量删除。
 - `参数错误`：运行 `python scripts/fetch.py --help` 查看真实接口。

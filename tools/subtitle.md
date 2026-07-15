@@ -22,7 +22,11 @@
 
 ## 步骤
 
-1. 设置真实链接和标题，调用统一配置入口：
+1. 先确定本流水线是否已经取得 `common.py prepare` 的 JSON。
+
+- 本流水线已有 prepare JSON：直接复用其中全部七个字段，跳到第 2 步；
+  不因跨午夜或来源标题变化再次 prepare。
+- 只有独立启动、尚未 prepare 时，才设置真实链接和标题并调用统一配置入口：
 
 ```bash
 URL='https://example.com/video'

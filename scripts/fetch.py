@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from datetime import datetime
 import json
 import math
+import os
 from pathlib import Path
 import re
 import shutil
@@ -306,8 +307,8 @@ def _metadata_text(value: object) -> str:
     return value if isinstance(value, str) else str(value)
 
 
-def write_metadata(info: dict, url: str, path: Path) -> None:
-    """把 yt-dlp 元数据写成流水线约定的稳定 JSON 结构。"""
+def _metadata_bytes(info: dict, url: str) -> bytes:
+    """把 yt-dlp 元数据序列化为稳定、可直接落盘的 UTF-8。"""
     payload = {
         "url": url,
         "title": _metadata_text(info.get("title")),
@@ -315,16 +316,96 @@ def write_metadata(info: dict, url: str, path: Path) -> None:
         "duration_s": _duration_seconds(info.get("duration")),
         "date": _readable_date(info.get("upload_date")),
     }
-    Path(path).write_text(
-        json.dumps(
+    try:
+        serialized = json.dumps(
             payload,
             ensure_ascii=False,
             indent=2,
             allow_nan=False,
-        )
-        + "\n",
-        encoding="utf-8",
-    )
+        ) + "\n"
+        return serialized.encode("utf-8")
+    except (TypeError, ValueError, UnicodeError):
+        raise FetchError(
+            "视频元数据包含无法写入的文本。"
+            "请换一个有效来源后重试。"
+        ) from None
+
+
+def _unlink_if_owned(path: Path, identity: tuple[int, int]) -> None:
+    """失败清理时仅删除本函数刚创建的 inode。"""
+    try:
+        current = path.lstat()
+        if (current.st_dev, current.st_ino) == identity:
+            path.unlink()
+    except BaseException:
+        # 原始写入异常更重要；无法确认身份时绝不继续删除。
+        pass
+
+
+def _write_exclusive_bytes(path: Path, content: bytes) -> None:
+    """以 O_EXCL 创建普通文件，已有路径（含 symlink）一律拒绝。"""
+    destination = Path(path)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    descriptor: int | None = None
+    owned_identity: tuple[int, int] | None = None
+    try:
+        descriptor = os.open(destination, flags, 0o600)
+        created = os.fstat(descriptor)
+        owned_identity = (created.st_dev, created.st_ino)
+        stream = os.fdopen(descriptor, "wb")
+        descriptor = None
+        with stream:
+            stream.write(content)
+    except BaseException as error:
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except BaseException:
+                pass
+        if owned_identity is not None:
+            _unlink_if_owned(destination, owned_identity)
+        if not isinstance(error, Exception):
+            raise
+        raise FetchError(
+            f"无法安全创建元数据文件 {destination}。"
+            "请移开同名项并检查目录权限后重试。"
+        ) from None
+
+
+def write_metadata(info: dict, url: str, path: Path) -> None:
+    """以独占普通文件写入稳定 JSON，绝不跟随现有符号链接。"""
+    _write_exclusive_bytes(Path(path), _metadata_bytes(info, url))
+
+
+def _write_staged_metadata(info: dict, url: str, directory: Path) -> Path:
+    """在 staging 中用不可预测的独占文件名写入元数据。"""
+    temporary_path: Path | None = None
+    owned_identity: tuple[int, int] | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="wb",
+            prefix=".meta-",
+            suffix=".json",
+            dir=directory,
+            delete=False,
+        ) as stream:
+            temporary_path = Path(stream.name)
+            created = os.fstat(stream.fileno())
+            owned_identity = (created.st_dev, created.st_ino)
+            stream.write(_metadata_bytes(info, url))
+        return temporary_path
+    except BaseException as error:
+        if temporary_path is not None and owned_identity is not None:
+            _unlink_if_owned(temporary_path, owned_identity)
+        if not isinstance(error, Exception):
+            raise
+        if isinstance(error, FetchError):
+            raise
+        raise FetchError(
+            "无法在临时区安全写入视频元数据。"
+            "请检查输出目录权限和磁盘空间后重试。"
+        ) from None
 
 
 def _runtime_opts(options: dict) -> dict:
@@ -382,12 +463,6 @@ class _EntryIdentity:
     device: int
     inode: int
     mode: int
-
-
-@dataclass(frozen=True)
-class _MoveAttempt:
-    moved: bool
-    error: BaseException | None
 
 
 class _TransactionConflict(Exception):
@@ -466,53 +541,38 @@ def _require_staged_regular(path: Path, label: str) -> _EntryIdentity:
     return identity
 
 
-def _replace_file(source: Path, destination: Path) -> None:
-    """为事务测试提供单一、可替换的原子 rename 边界。"""
-    source.replace(destination)
+def _link_file(source: Path, destination: Path) -> None:
+    """原子创建硬链接；目标已存在时绝不覆盖。"""
+    os.link(source, destination, follow_symlinks=False)
 
 
-def _attempt_observed_move(
+def _unlink_file(path: Path) -> None:
+    """为事务测试提供可注入故障的 unlink 边界。"""
+    path.unlink()
+
+
+def _move_noreplace(
     source: Path,
     destination: Path,
     expected_source: _EntryIdentity,
-) -> _MoveAttempt:
-    """执行 rename 并用 lstat 确认“返回/抛错后究竟有没有移动”。"""
-    try:
-        if _entry_identity(source) != expected_source:
-            return _MoveAttempt(
-                False,
-                _TransactionConflict("源文件身份已变化"),
-            )
-        if _entry_identity(destination) is not None:
-            return _MoveAttempt(
-                False,
-                _TransactionConflict("目标槽位不再为空"),
-            )
-    except OSError as error:
-        return _MoveAttempt(False, error)
+) -> None:
+    """以 link + unlink 完成同卷 NOREPLACE 移动，并逐步观测身份。"""
+    if _entry_identity(source) != expected_source:
+        raise _TransactionConflict("源文件身份已变化")
+    if _entry_identity(destination) is not None:
+        raise _TransactionConflict("目标槽位不再为空")
 
-    operation_error: BaseException | None = None
-    try:
-        _replace_file(source, destination)
-    except BaseException as error:
-        operation_error = error
+    # os.link 是唯一发布原语：EEXIST、EXDEV 或不支持时直接失败，
+    # 绝不退回任何会覆盖竞争者目标项的 rename 操作。
+    _link_file(source, destination)
+    if _entry_identity(destination) != expected_source:
+        raise _TransactionConflict("硬链接返回后目标身份不符合预期")
 
-    try:
-        source_after = _entry_identity(source)
-        destination_after = _entry_identity(destination)
-    except OSError as error:
-        return _MoveAttempt(
-            False, operation_error or error
-        )
-    moved = (
-        source_after != expected_source
-        and destination_after == expected_source
-    )
-    if not moved and operation_error is None:
-        operation_error = _TransactionConflict(
-            "rename 返回后文件身份不符合预期"
-        )
-    return _MoveAttempt(moved, operation_error)
+    _unlink_file(source)
+    if _entry_identity(destination) != expected_source:
+        raise _TransactionConflict("移除源文件后目标身份发生变化")
+    if _entry_identity(source) is not None:
+        raise _TransactionConflict("移除源文件后原路径仍有目录项")
 
 
 def _new_staging_dir(destination: Path) -> Path:
@@ -528,50 +588,75 @@ def _new_staging_dir(destination: Path) -> Path:
 def _write_recovery_guide(staging_dir: Path, label: str) -> bool:
     guide = staging_dir / "RECOVERY.txt"
     try:
-        guide.write_text(
+        content = (
             f"{label}发布失败，自动回滚未完成。\n"
             "1. 暂停重试下载，先备份本目录。\n"
-            "2. backups/ 中是发布前的旧文件；failed-new/ 中是未发布完整的新文件。\n"
+            "2. backups/ 中是发布前的旧文件；new/（若存在）和 "
+            "failed-new/ 中是未发布完整的新文件。\n"
             "3. 核对输出目录中对应的最终文件，"
-            "再将 backups/ 中缺失的旧文件移回。\n",
-            encoding="utf-8",
+            "再将 backups/ 中缺失的旧文件移回。\n"
         )
+        _write_exclusive_bytes(guide, content.encode("utf-8"))
         return True
-    except OSError:
-        # 恢复资料本身比说明文件更重要；保留 staging 路径供人工检查。
+    except Exception:
+        # 恢复资料更重要；保留 staging 路径供人工检查。
         return False
 
 
 def _rollback_transaction(
-    published: list[tuple[Path, _EntryIdentity]],
-    backed_up: list[tuple[Path, Path, _EntryIdentity]],
+    staged_and_final: Sequence[tuple[Path, Path]],
+    staged_identities: dict[Path, _EntryIdentity],
     initial_states: dict[Path, _EntryIdentity | None],
     staging_dir: Path,
 ) -> bool:
+    """只依据实时 lstat 身份恢复事务前状态，不信任进度列表。"""
+    backups_dir = staging_dir / "backups"
     failed_new_dir = staging_dir / "failed-new"
-    for final_path, identity in reversed(published):
-        _attempt_observed_move(
-            final_path, failed_new_dir / final_path.name, identity
-        )
-    for final_path, backup_path, identity in reversed(backed_up):
-        try:
-            current_final = _entry_identity(final_path)
-        except OSError:
+    for staged_path, final_path in reversed(staged_and_final):
+        initial_identity = initial_states[final_path]
+        staged_identity = staged_identities[staged_path]
+        current_final = _entry_identity(final_path)
+
+        if current_final == initial_identity:
             continue
-        if current_final == identity:
+        if current_final == staged_identity:
+            # 尽量保留唯一的新产物副本；失败也要继续恢复旧槽位。
+            failed_path = failed_new_dir / final_path.name
+            if _entry_identity(failed_path) is None:
+                try:
+                    _link_file(final_path, failed_path)
+                except BaseException:
+                    pass
+            # 重新观测后才删除，未知竞态文件绝不触碰。
+            if _entry_identity(final_path) == staged_identity:
+                try:
+                    _unlink_file(final_path)
+                except BaseException:
+                    pass
+            current_final = _entry_identity(final_path)
+
+        if current_final == initial_identity:
             continue
         if current_final is not None:
             # 不覆盖外部竞态产生的未知文件。
             continue
-        _attempt_observed_move(backup_path, final_path, identity)
+        if initial_identity is None:
+            continue
 
-    try:
-        return all(
-            _entry_identity(path) == identity
-            for path, identity in initial_states.items()
-        )
-    except OSError:
-        return False
+        backup_path = backups_dir / final_path.name
+        if _entry_identity(backup_path) != initial_identity:
+            continue
+        try:
+            # 回滚也用 NOREPLACE；保留 backup 到最终状态核验完成。
+            _link_file(backup_path, final_path)
+        except BaseException:
+            pass
+        _entry_identity(final_path)
+
+    return all(
+        _entry_identity(path) == identity
+        for path, identity in initial_states.items()
+    )
 
 
 def _publish_transaction(
@@ -580,59 +665,60 @@ def _publish_transaction(
     staging_dir: Path,
     label: str,
 ) -> None:
-    """发布一个或多个文件，并对抛错后已完成的 rename 做观测式回滚。"""
+    """用同卷 NOREPLACE 发布，并按文件身份恢复事务前状态。"""
     _verify_slot_states(initial_states)
+    staged_identities: dict[Path, _EntryIdentity] = {}
+    for staged_path, _final_path in staged_and_final:
+        try:
+            identity = _entry_identity(staged_path)
+        except OSError:
+            identity = None
+        if identity is None or not stat.S_ISREG(identity.mode):
+            raise FetchError(
+                "临时产物在发布前消失或不再是普通文件。"
+                "请更新 yt-dlp 与 ffmpeg 后重试。"
+            )
+        staged_identities[staged_path] = identity
+
     backups_dir = staging_dir / "backups"
     failed_new_dir = staging_dir / "failed-new"
     backups_dir.mkdir()
     failed_new_dir.mkdir()
-    backed_up: list[tuple[Path, Path, _EntryIdentity]] = []
-    published: list[tuple[Path, _EntryIdentity]] = []
-    failure: BaseException | None = None
 
-    for _staged_path, final_path in staged_and_final:
-        identity = initial_states[final_path]
-        if identity is None:
-            continue
-        backup_path = backups_dir / final_path.name
-        attempt = _attempt_observed_move(
-            final_path, backup_path, identity
-        )
-        if attempt.moved:
-            backed_up.append((final_path, backup_path, identity))
-        if attempt.error is not None:
-            failure = attempt.error
-            break
-
-    if failure is None:
-        for staged_path, final_path in staged_and_final:
-            try:
-                staged_identity = _entry_identity(staged_path)
-            except OSError as error:
-                staged_identity = None
-                failure = error
-            if staged_identity is None or not stat.S_ISREG(
-                staged_identity.mode
-            ):
-                failure = failure or _TransactionConflict(
-                    "临时产物在发布前消失或不再是普通文件"
-                )
-                break
-            attempt = _attempt_observed_move(
-                staged_path, final_path, staged_identity
+    try:
+        for _staged_path, final_path in staged_and_final:
+            identity = initial_states[final_path]
+            if identity is None:
+                continue
+            _move_noreplace(
+                final_path,
+                backups_dir / final_path.name,
+                identity,
             )
-            if attempt.moved:
-                published.append((final_path, staged_identity))
-            if attempt.error is not None:
-                failure = attempt.error
-                break
 
-    if failure is None:
+        for staged_path, final_path in staged_and_final:
+            _move_noreplace(
+                staged_path,
+                final_path,
+                staged_identities[staged_path],
+            )
         return
+    except BaseException as error:
+        # 这个 guard 覆盖 link/unlink 以及所有 mutation 后的身份观测；
+        # 异常发生在“操作已完成、进度尚未记录”的缝隙也能恢复。
+        failure = error
 
-    if not _rollback_transaction(
-        published, backed_up, initial_states, staging_dir
-    ):
+    try:
+        rollback_complete = _rollback_transaction(
+            staged_and_final,
+            staged_identities,
+            initial_states,
+            staging_dir,
+        )
+    except BaseException:
+        rollback_complete = False
+
+    if not rollback_complete:
         try:
             guide_written = _write_recovery_guide(staging_dir, label)
         except BaseException:
@@ -644,7 +730,7 @@ def _publish_transaction(
         else:
             recovery_action = (
                 "恢复说明写入失败；请暂停重试，直接检查 "
-                "backups/ 和 failed-new/ 与最终槽位。"
+                "backups/、new/、failed-new/ 与最终槽位。"
             )
         raise _RecoveryRequired(
             f"{label}发布失败，自动回滚也未完成。"
@@ -652,8 +738,6 @@ def _publish_transaction(
             f"{recovery_action}"
         ) from None
 
-    if isinstance(failure, (KeyboardInterrupt, SystemExit)):
-        raise failure
     if not isinstance(failure, Exception):
         raise failure
     restored = (
@@ -663,7 +747,8 @@ def _publish_transaction(
     )
     raise FetchError(
         f"{label}发布失败，{restored}。"
-        "请检查输出目录权限和磁盘空间后重试。"
+        "请检查输出目录权限、磁盘空间，"
+        "以及文件系统是否支持同卷硬链接后重试。"
     ) from None
 
 
@@ -750,8 +835,7 @@ def _download_media(
         _require_staged_regular(downloaded_path, filename)
 
         if mode == "video":
-            temporary_metadata = new_dir / "meta.json"
-            write_metadata(info, url, temporary_metadata)
+            temporary_metadata = _write_staged_metadata(info, url, new_dir)
             _require_staged_regular(temporary_metadata, "meta.json")
             _publish_transaction(
                 (
