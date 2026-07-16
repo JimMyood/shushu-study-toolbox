@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>三步安装</title>
+  <link rel="stylesheet" href="notion-card.css">
+</head>
+<body data-ready="1">
+  <main class="canvas">
+    <aside class="sidebar">
+      <div class="workspace-mark">S</div>
+      <div class="side-lines" aria-hidden="true"><span class="side-line active"></span><span class="side-line"></span><span class="side-line"></span><span class="side-line"></span></div>
+      <div class="side-index">SHUSHU / 04</div>
+    </aside>
+
+    <article class="page">
+      <header class="topbar">
+        <div class="crumb"><span class="crumb-dot"></span>树树工具箱 / Install</div>
+        <div class="top-actions">04 / 05</div>
+      </header>
+
+      <section class="hero">
+        <div class="page-icon">📥</div>
+        <div class="eyebrow">Three-step setup</div>
+        <h1>怎么装？</h1>
+        <p class="lead">第一次照 README 走，之后只需要说目标。</p>
+      </section>
+
+      <section class="section steps">
+        <div class="step">
+          <div class="step-num">01</div>
+          <div><div class="step-title">下载仓库，安装依赖</div><div class="step-copy">推荐 Python 3.13；按使用功能安装 ffmpeg、yt-dlp 等本地工具。</div></div>
+        </div>
+        <div class="step">
+          <div class="step-num">02</div>
+          <div><div class="step-title">跑一次环境自检</div><div class="step-copy">先发现缺什么，再开始长任务。</div></div>
+        </div>
+        <div class="step">
+          <div class="step-num">03</div>
+          <div><div class="step-title">让 agent 读取 SKILL.md</div><div class="step-copy">Claude Code、Codex 等本地 agent 均可按说明接入。</div></div>
+        </div>
+      </section>
+
+      <section class="section compact">
+        <div class="section-label">Terminal</div>
+        <div class="code">python3.13 -m venv .venv
+source .venv/bin/activate
+python -m pip install -r requirements.txt
+python scripts/doctor.py</div>
+      </section>
+
+      <section class="section compact">
+        <div class="callout blue" data-icon="i">不需要填写外部 AI API Key。完整安装命令以仓库 README 为准。</div>
+      </section>
+
+      <footer class="footer">
+        <span class="footer-brand">SHUSHU STUDY TOOLBOX</span>
+        <div class="dots"><span class="dot"></span><span class="dot"></span><span class="dot"></span><span class="dot"></span><span class="dot active"></span><span class="dot"></span></div>
+      </footer>
+    </article>
+  </main>
+</body>
+</html>

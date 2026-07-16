@@ -1,9 +1,9 @@
 # Shushu Study Toolbox / 树树工具箱
 
-**English quick start:** Shushu Study Toolbox is an agent skill that turns public videos, subtitles, webpages, and PDFs into bilingual study materials without requiring an external API key. Local transcription supports Python 3.10–3.13; Python 3.13 is recommended. On macOS/Linux, replace both placeholders below. Set `PYTHON_BIN` to an interpreter that you have already checked is in that supported range, then run:
+**English quick start:** Shushu Study Toolbox is an agent skill that turns public videos, subtitles, webpages, and PDFs into bilingual study materials without requiring an external API key. Local transcription supports Python 3.10–3.13; Python 3.13 is recommended. On macOS/Linux, set `PYTHON_BIN` to an interpreter that you have already checked is in that supported range, then run:
 
 ```bash
-git clone https://github.com/<your-github-username>/shushu-study-toolbox.git
+git clone https://github.com/JimMyood/shushu-study-toolbox.git
 cd shushu-study-toolbox
 for candidate in python3.13 python3.12 python3.11 python3.10 python3; do
   command -v "$candidate" >/dev/null && "$candidate" --version
@@ -50,10 +50,10 @@ python scripts/doctor.py
 
 ### 1. Clone 仓库
 
-先把 `<你的 GitHub 用户名>` 替换成实际用户名：
+克隆仓库：
 
 ```bash
-git clone https://github.com/<你的 GitHub 用户名>/shushu-study-toolbox.git
+git clone https://github.com/JimMyood/shushu-study-toolbox.git
 cd shushu-study-toolbox
 ```
 
