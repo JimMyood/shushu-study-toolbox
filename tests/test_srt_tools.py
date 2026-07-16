@@ -328,6 +328,7 @@ def test_chunk_v2_stale_target_race_uses_next_name_without_overwriting_competito
     assert srt_tools.chunk_subtitles(input_path, 1, chunks_dir) == 0
     translation_path = chunks_dir / "chunk_000.translated.txt"
     translation_path.write_text("OLD_TRANSLATION\n", encoding="utf-8")
+    old_translation = translation_path.read_bytes()
     input_path.write_text(
         "1\n00:00:00,000 --> 00:00:01,000\nBeta\n",
         encoding="utf-8",
@@ -364,7 +365,7 @@ def test_chunk_v2_stale_target_race_uses_next_name_without_overwriting_competito
     assert own_stales[0].read_text(encoding="utf-8") == "OLD_TRANSLATION\n"
     archives = list(chunks_dir.glob(".srt-safety-archive-*"))
     assert len(archives) == 1
-    assert b"OLD_TRANSLATION\n" in _regular_file_payloads(archives[0])
+    assert old_translation in _regular_file_payloads(archives[0])
     assert str(archives[0]) in captured.err
     assert "私有安全归档" in captured.err
     assert not translation_path.exists()
@@ -452,6 +453,7 @@ def test_chunk_v2_source_swap_is_preserved_in_recovery_and_never_reports_success
     source_chunk_before = (chunks_dir / "chunk_000.txt").read_bytes()
     competitor = tmp_path / "competitor.tmp"
     competitor.write_text("COMPETING_TRANSLATION\n", encoding="utf-8")
+    competitor_payload = competitor.read_bytes()
     real_replace = os.replace
     injected = {"done": False}
 
@@ -480,7 +482,7 @@ def test_chunk_v2_source_swap_is_preserved_in_recovery_and_never_reports_success
     assert (chunks_dir / "manifest.json").read_bytes() == manifest_before
     assert (chunks_dir / "chunk_000.txt").read_bytes() == source_chunk_before
     assert translation_path.read_text(encoding="utf-8") == "OLD_TRANSLATION\n"
-    assert b"COMPETING_TRANSLATION\n" in _regular_file_payloads(chunks_dir)
+    assert competitor_payload in _regular_file_payloads(chunks_dir)
 
 
 def test_chunk_v2_stale_swap_after_validation_keeps_old_translation_in_recovery(
@@ -944,6 +946,7 @@ def test_chunk_legacy_stale_target_race_uses_next_name_without_overwrite(
     (chunks_dir / "manifest.json").write_text("{}\n", encoding="utf-8")
     legacy_path = chunks_dir / "chunk_000.zh.txt"
     legacy_path.write_text("LEGACY_TRANSLATION\n", encoding="utf-8")
+    legacy_translation = legacy_path.read_bytes()
     real_link = os.link
     injected = {"path": None}
 
@@ -978,7 +981,7 @@ def test_chunk_legacy_stale_target_race_uses_next_name_without_overwrite(
     )
     archives = list(chunks_dir.glob(".srt-safety-archive-*"))
     assert len(archives) == 1
-    assert b"LEGACY_TRANSLATION\n" in _regular_file_payloads(archives[0])
+    assert legacy_translation in _regular_file_payloads(archives[0])
     assert str(archives[0]) in captured.err
     assert "私有安全归档" in captured.err
     assert not legacy_path.exists()
@@ -1051,6 +1054,10 @@ def test_chunk_legacy_resume_isolates_every_zh_and_marks_all_for_retranslation(
         path.name: path.read_text(encoding="utf-8")
         for path in chunks_dir.glob("chunk_*.zh.txt")
     }
+    legacy_payloads = {
+        path.name: path.read_bytes()
+        for path in chunks_dir.glob("chunk_*.zh.txt")
+    }
     existing_stale = chunks_dir / "chunk_000.stale-legacy.txt"
     existing_stale.write_text("更早的旧译文\n", encoding="utf-8")
 
@@ -1079,9 +1086,9 @@ def test_chunk_legacy_resume_isolates_every_zh_and_marks_all_for_retranslation(
     ) == legacy_contents["chunk_002.zh.txt"]
     archives = list(chunks_dir.glob(".srt-safety-archive-*"))
     assert len(archives) == 1
-    assert set(_regular_file_payloads(archives[0])) == {
-        content.encode("utf-8") for content in legacy_contents.values()
-    }
+    assert set(_regular_file_payloads(archives[0])) == set(
+        legacy_payloads.values()
+    )
     assert str(archives[0]) in result.stderr
     assert "私有安全归档" in result.stderr
 
